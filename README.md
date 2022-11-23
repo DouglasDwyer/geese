@@ -1,5 +1,8 @@
 # geese
 
+[![Crates.io](https://img.shields.io/crates/v/geese.svg)](https://crates.io/crates/geese)
+[![Docs.rs](https://docs.rs/geese/badge.svg)](https://docs.rs/geese)
+
 Geese is a game event system for Rust, built to allow modular game engine design.
 
 In Geese, a system is a struct with internal state and a collection of associated

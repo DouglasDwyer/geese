@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/geese"
 readme = "README.md"
 description = """
-Geese: dead-simple game event system for Rust.
+Dead-simple game event system for Rust.
 """
 
 [dependencies]
