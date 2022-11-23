@@ -16,7 +16,7 @@ system `A` is loaded first (beause it is a dependency of `B`), and then
 system `B` is loaded. `B` receives the typed event, and responds by querying
 system `A` for some information.
 
-```
+```rust
 struct A;
 
 impl A {
