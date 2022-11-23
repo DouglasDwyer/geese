@@ -1,7 +1,14 @@
 [package]
 name = "geese"
+authors = "Douglas Dwyer <dougmdwyer@hotmail.com>"
 version = "0.1.0"
 edition = "2021"
-
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DouglasDwyer/geese"
+readme = "README.md"
+description = """
+Geese: dead-simple game event system for Rust.
+"""
 
 [dependencies]
+topological-sort = "0.2.2"
