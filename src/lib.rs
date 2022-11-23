@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 //! Geese is a game event system for Rust, built to allow modular game engine design.
 //!
 //! In Geese, a system is a struct with internal state and a collection of associated
@@ -578,5 +580,39 @@ mod tests {
         ctx.raise_event(ab.clone());
         ctx.flush_events();
         assert!(ab.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_system_event_twice_panic() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(event::NotifyAddSystem::new::<B>());
+        ctx.raise_event(event::NotifyAddSystem::new::<B>());
+        ctx.flush_events();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_system_twice_panic() {
+        let mut ctx = GeeseContext::default();
+        ctx.add_system::<B>();
+        ctx.add_system::<B>();
+        ctx.flush_events();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remove_system_event_unknown_panic() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(event::NotifyRemoveSystem::new::<B>());
+        ctx.flush_events();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remove_system_unknown_panic() {
+        let mut ctx = GeeseContext::default();
+        ctx.remove_system::<B>();
+        ctx.flush_events();
     }
 }
