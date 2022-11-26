@@ -60,7 +60,7 @@
 //! fn run() {
 //!     let ab = Arc::new(AtomicBool::new(false));
 //!     let mut ctx = GeeseContext::default();
-//!     ctx.raise_event(event::NotifyAddSystem::new::<B>());
+//!     ctx.raise_event(notify::AddSystem::new::<B>());
 //!     ctx.raise_event(ab.clone());
 //!     ctx.flush_events();
 //!     assert!(ab.load(Ordering::Relaxed));
@@ -200,11 +200,11 @@ impl GeeseContext {
 
     /// Handles an event by broadcasting it to all systems.
     fn handle_event(&mut self, event: &dyn Any) {
-        if event.type_id() == TypeId::of::<event::NotifyAddSystem>() {
-            self.queue_add_system(event.downcast_ref::<event::NotifyAddSystem>().expect("Event type ID did not match type").builder.clone());
+        if event.type_id() == TypeId::of::<notify::AddSystem>() {
+            self.queue_add_system(event.downcast_ref::<notify::AddSystem>().expect("Event type ID did not match type").builder.clone());
         }
-        else if event.type_id() == TypeId::of::<event::NotifyRemoveSystem>() {
-            self.queue_remove_system(event.downcast_ref::<event::NotifyRemoveSystem>().expect("Event type ID did not match type").type_id);
+        else if event.type_id() == TypeId::of::<notify::RemoveSystem>() {
+            self.queue_remove_system(event.downcast_ref::<notify::RemoveSystem>().expect("Event type ID did not match type").type_id);
         }
         else {
             self.reload_dirty_systems();
@@ -481,16 +481,16 @@ impl<'a, T> DerefMut for SystemRefMut<'a, T> {
     }
 }
 
-/// Provides events for interacting directly with the Geese context.
-pub mod event {
+/// Provides events to which the Geese context responds.
+pub mod notify {
     use super::*;
 
     /// Causes Geese to load a system during the next event cycle. The context will panic if the system was already present.
-    pub struct NotifyAddSystem {
+    pub struct AddSystem {
         pub(super) builder: Arc<dyn SystemBuilder>
     }
 
-    impl NotifyAddSystem {
+    impl AddSystem {
         /// Tells Geese to load the specified system when this event triggers.
         pub fn new<S: GeeseSystem>() -> Self {
             let builder = Arc::new(TypedSystemBuilder::<S>::new());
@@ -499,11 +499,11 @@ pub mod event {
     }
 
     /// Causes Geese to remove a system during the next event cycle. The context will panic if the system was not present.
-    pub struct NotifyRemoveSystem {
+    pub struct RemoveSystem {
         pub(super) type_id: TypeId
     }
 
-    impl NotifyRemoveSystem {
+    impl RemoveSystem {
         /// Tells Geese to unload the specified system when this event triggers.
         pub fn new<S: GeeseSystem>() -> Self {
             let type_id = TypeId::of::<S>();
@@ -576,7 +576,7 @@ mod tests {
     fn test_dependent_system() {
         let ab = Arc::new(AtomicBool::new(false));
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(event::NotifyAddSystem::new::<B>());
+        ctx.raise_event(notify::AddSystem::new::<B>());
         ctx.raise_event(ab.clone());
         ctx.flush_events();
         assert!(ab.load(Ordering::Relaxed));
@@ -586,8 +586,8 @@ mod tests {
     #[should_panic]
     fn test_add_system_event_twice_panic() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(event::NotifyAddSystem::new::<B>());
-        ctx.raise_event(event::NotifyAddSystem::new::<B>());
+        ctx.raise_event(notify::AddSystem::new::<B>());
+        ctx.raise_event(notify::AddSystem::new::<B>());
         ctx.flush_events();
     }
 
@@ -604,7 +604,7 @@ mod tests {
     #[should_panic]
     fn test_remove_system_event_unknown_panic() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(event::NotifyRemoveSystem::new::<B>());
+        ctx.raise_event(notify::RemoveSystem::new::<B>());
         ctx.flush_events();
     }
 
