@@ -70,6 +70,7 @@
 use std::any::*;
 use std::cell::*;
 use std::collections::*;
+use std::fmt::*;
 use std::hash::*;
 use std::marker::*;
 use std::sync::*;
@@ -141,6 +142,12 @@ impl GeeseContextHandle {
             let holder = x.get(&TypeId::of::<T>()).expect("System was not loaded.").as_ref().expect("Cannot obtain a reference to the current system.");
             holder.system().downcast_ref::<T>().expect("System was not of the correct type.")
         }))
+    }
+}
+
+impl Debug for GeeseContextHandle {
+    fn fmt(&self, _: &mut Formatter<'_>) -> Result {
+        Ok(())
     }
 }
 
@@ -279,6 +286,12 @@ impl GeeseContext {
         let count = ts.len();
         let output = ts.into_iter().collect::<Vec<_>>();
         (count == output.len()).then(|| output)
+    }
+}
+
+impl Debug for GeeseContext {
+    fn fmt(&self, _: &mut Formatter<'_>) -> Result {
+        Ok(())
     }
 }
 
