@@ -170,12 +170,12 @@ impl GeeseContext {
         while let Some(event) = self.next_event() {
             self.handle_event(&*event);
         }
+        self.reload_dirty_systems();
     }
 
     /// Obtains a reference to the given system.
     pub fn system<S: GeeseSystem>(&mut self) -> SystemRef<'_, S> {
         self.flush_events();
-        self.reload_dirty_systems();
         SystemRef::new(Ref::map(self.inner.systems(), |x|
             x.get(&TypeId::of::<S>()).expect("System not found.")
                 .as_ref().expect("System was currently borrowed.")
@@ -185,7 +185,6 @@ impl GeeseContext {
     /// Mutably obtains a reference to the given system.
     pub fn system_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<'_, S> {
         self.flush_events();
-        self.reload_dirty_systems();
         SystemRefMut::new(RefMut::map(self.inner.systems_mut(), |x|
             x.get_mut(&TypeId::of::<S>()).expect("System not found.")
                 .as_mut().expect("System was currently borrowed.")
@@ -409,7 +408,6 @@ impl<S: GeeseSystem> SystemBuilder for TypedSystemBuilder<S> {
     }
 
     fn event_responders(&self, event_id: TypeId) -> &[Box<dyn EventHandler>] {
-        println!("Eve type {:?}", event_id);
         self.event_handlers.get(&event_id).map(|x| &x[..]).unwrap_or(&[])
     }
 
