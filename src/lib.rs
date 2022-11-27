@@ -155,7 +155,6 @@ impl Debug for GeeseContextHandle {
 #[derive(Default)]
 pub struct GeeseContext {
     active_systems: HashMap<TypeId, Arc<dyn SystemBuilder>>,
-    dirty: bool,
     inner: InnerContext,
 }
 
@@ -170,7 +169,6 @@ impl GeeseContext {
         while let Some(event) = self.next_event() {
             self.handle_event(&*event);
         }
-        self.reload_dirty_systems();
     }
 
     /// Obtains a reference to the given system.
@@ -199,13 +197,13 @@ impl GeeseContext {
     /// Handles an event by broadcasting it to all systems.
     fn handle_event(&mut self, event: &dyn Any) {
         if event.type_id() == TypeId::of::<notify::AddSystem>() {
-            self.queue_add_system(event.downcast_ref::<notify::AddSystem>().expect("Event type ID did not match type").builder.clone());
+            self.add_system(event.downcast_ref::<notify::AddSystem>().expect("Event type ID did not match type").builder.clone());
         }
         else if event.type_id() == TypeId::of::<notify::RemoveSystem>() {
-            self.queue_remove_system(event.downcast_ref::<notify::RemoveSystem>().expect("Event type ID did not match type").type_id);
+            self.remove_system(event.downcast_ref::<notify::RemoveSystem>().expect("Event type ID did not match type").type_id);
         }
-        else {
-            self.reload_dirty_systems();
+        else if event.type_id() == TypeId::of::<notify::ResetSystem>() {
+            self.reload_system(event.downcast_ref::<notify::ResetSystem>().expect("Event type ID did not match type").type_id);
         }
 
         for id in self.system_ids() {
@@ -215,52 +213,87 @@ impl GeeseContext {
         }
     }
 
+    /// Obtains the IDs of all currently-loaded systems.
     fn system_ids(&self) -> impl Iterator<Item = TypeId> {
         self.inner.systems().keys().cloned().collect::<Vec<_>>().into_iter()
     }
     
     /// Activates and deactivates the appropriate systems if they have changed.
-    fn reload_dirty_systems(&mut self) {
-        if self.dirty {
-            self.dirty = false;
+    fn reload_systems(&mut self) {
+        let activation_order = Self::determine_system_order(self.active_systems.values().cloned()).expect("Cannot instantiate systems due to a cyclic dependency.");
+        let deactivation_order =
+        Self::determine_system_order(self.inner.systems().values().map(|x| x.as_ref().expect("Could not borrow system, as it was already borrowed.").builder()))
+            .expect("Cannot deactive systems due to a cyclic dependency.");
+
+        for system in &activation_order {
+            if !self.inner.systems_mut().contains_key(&system.system_id()) {
+                let holder = SystemHolder::new(self.inner.clone(), system.clone());
+                self.inner.systems_mut().insert(system.system_id(), Some(holder));
+            }
+        }
+
+        for system in deactivation_order.iter().rev() {
+            if !activation_order.iter().map(|x| (**x).system_id()).collect::<Vec<_>>().contains(&system.system_id()) {
+                drop(self.inner.systems_mut().remove(&system.system_id()));
+            }
+        }
+    }
+
+    /// Reloads the specified system and all of its dependencies.
+    fn reload_system(&mut self, system_id: TypeId) {
+        for system in Self::determine_system_order(self.determine_dependent_system_list(system_id)).expect("Cyclic dependency between systems occurred.").into_iter().rev() {
+            self.inner.systems_mut().insert(system.system_id(), None).expect("Replaced empty system.");
             
-            let activation_order = Self::determine_system_order(self.active_systems.values()).expect("Cannot instantiate systems due to a cyclic dependency.");
-            let deactivation_order =
-                Self::determine_system_order(self.inner.systems().values().map(|x| x.as_ref().expect("Could not borrow system, as it was already borrowed.").builder()).collect::<Vec<_>>().iter())
-                    .expect("Cannot deactive systems due to a cyclic dependency.");
-
-            for system in &activation_order {
-                if !self.inner.systems_mut().contains_key(&system.system_id()) {
-                    self.inner.systems_mut().insert(system.system_id(), Some(SystemHolder::new(self.inner.clone(), system.clone())));
-                }
-            }
-
-            for system in deactivation_order.iter().rev() {
-                if !activation_order.iter().map(|x| (**x).system_id()).collect::<Vec<_>>().contains(&system.system_id()) {
-                    drop(self.inner.systems_mut().remove(&system.system_id()));
-                }
-            }
+            let holder = SystemHolder::new(self.inner.clone(), system.clone());
+            self.inner.systems_mut().insert(system.system_id(), Some(holder));
         }
     }
 
     /// Adds a system for use in the current Geese context.
-    fn queue_add_system(&mut self, builder: Arc<dyn SystemBuilder>) {
+    fn add_system(&mut self, builder: Arc<dyn SystemBuilder>) {
         if self.active_systems.contains_key(&builder.system_id()) {
             panic!("Attempted to add duplicate system.");
         }
         self.active_systems.insert(builder.system_id(), builder);
-        self.dirty = true;
+        self.reload_systems();
     }
 
     /// Removes a system from use in the current Geese context.
-    fn queue_remove_system(&mut self, type_id: TypeId) {
+    fn remove_system(&mut self, type_id: TypeId) {
         self.active_systems.remove(&type_id).expect("Attempted to remove unknown system.");
-        self.dirty = true;
+        self.reload_systems();
+    }
+
+    /// Determines the set of all systems that depend upon this one.
+    fn determine_dependent_system_list(&mut self, system_id: TypeId) -> impl Iterator<Item = Arc<dyn SystemBuilder>> {
+        let systems = self.inner.systems();
+
+        let mut set = HashSet::new();
+        set.insert(system_id);
+
+        let keys = systems.keys().cloned().collect::<Vec<_>>();
+        let mut finished = false;
+        while !finished {
+            finished = true;
+            for &system in &keys {
+                if !set.contains(&system) {
+                    for dependent in systems[&system].as_ref().expect("System was borrowed.").builder().dependencies() {
+                        if set.contains(&dependent.system_id()) {
+                            finished = false;
+                            set.insert(system);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        set.into_iter().map(|x| systems[&x].as_ref().expect("System was borrowed.").builder()).collect::<Vec<_>>().into_iter()
     }
 
     /// Determines the topological load ordering for the set of systems and all of their dependencies. Returns
     /// none if a cyclic dependency is found.
-    fn determine_system_order<'a>(systems: impl Iterator<Item = &'a Arc<dyn SystemBuilder>>) -> Option<Vec<Arc<dyn SystemBuilder>>> {
+    fn determine_system_order(systems: impl Iterator<Item = Arc<dyn SystemBuilder>>) -> Option<Vec<Arc<dyn SystemBuilder>>> {
         let mut ts = TopologicalSort::new();
         let mut required_systems = HashSet::new();
         let mut to_be_processed = systems.collect::<Vec<_>>();
@@ -269,7 +302,7 @@ impl GeeseContext {
             for dependency in x.dependencies() {
                 if !required_systems.contains(&dependency.system_id()) {
                     required_systems.insert(dependency.system_id());
-                    ts.add_dependency(x.clone(), dependency.clone());
+                    ts.add_dependency(dependency.clone(), x.clone());
                 }
             }
         }
@@ -513,6 +546,19 @@ pub mod notify {
             Self { type_id }
         }
     }
+
+    /// Causes Geese to reload a system during the next event cycle. The context will panic if the system was not present.
+    pub struct ResetSystem {
+        pub(super) type_id: TypeId
+    }
+
+    impl ResetSystem {
+        /// Tells Geese to reset the specified system when this event triggers.
+        pub fn new<S: GeeseSystem>() -> Self {
+            let type_id = TypeId::of::<S>();
+            Self { type_id }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -525,7 +571,7 @@ mod tests {
 
     impl A {
         fn increment(&mut self, event: &Arc<AtomicUsize>) {
-            event.store(1, Ordering::Relaxed);
+            event.fetch_add(1, Ordering::Relaxed);
         }
 
         pub fn answer(&self) -> bool {
@@ -555,6 +601,7 @@ mod tests {
 
     impl GeeseSystem for B {
         fn new(ctx: GeeseContextHandle) -> Self {
+            ctx.raise_event(());
             Self { ctx }
         }
 
@@ -565,11 +612,35 @@ mod tests {
         }
     }
 
+    struct C {
+        counter: usize
+    }
+
+    impl C {
+        pub fn counter(&self) -> usize {
+            self.counter
+        }
+
+        fn increment_counter(&mut self, _: &()) {
+            self.counter += 1;
+        }
+    }
+
+    impl GeeseSystem for C {
+        fn new(_: GeeseContextHandle) -> Self {
+            Self { counter: 0 }
+        }
+
+        fn register(with: &mut GeeseSystemData<Self>) {
+            with.event(Self::increment_counter);
+        }
+    }
+
     #[test]
     fn test_single_system() {
         let ab = Arc::new(AtomicUsize::new(0));
         let mut ctx = GeeseContext::default();
-        ctx.add_system::<A>();
+        ctx.raise_event(notify::AddSystem::new::<A>());
         ctx.raise_event(ab.clone());
         ctx.flush_events();
         assert!(ab.load(Ordering::Relaxed) == 1);
@@ -586,6 +657,16 @@ mod tests {
     }
 
     #[test]
+    fn test_system_reload() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::AddSystem::new::<C>());
+        ctx.raise_event(notify::AddSystem::new::<B>());
+        assert_eq!(ctx.system::<C>().counter(), 1);
+        ctx.raise_event(notify::ResetSystem::new::<A>());
+        assert_eq!(ctx.system::<C>().counter(), 2);
+    }
+
+    #[test]
     #[should_panic]
     fn test_add_system_event_twice_panic() {
         let mut ctx = GeeseContext::default();
@@ -596,26 +677,9 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_add_system_twice_panic() {
-        let mut ctx = GeeseContext::default();
-        ctx.add_system::<B>();
-        ctx.add_system::<B>();
-        ctx.flush_events();
-    }
-
-    #[test]
-    #[should_panic]
     fn test_remove_system_event_unknown_panic() {
         let mut ctx = GeeseContext::default();
         ctx.raise_event(notify::RemoveSystem::new::<B>());
-        ctx.flush_events();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_remove_system_unknown_panic() {
-        let mut ctx = GeeseContext::default();
-        ctx.remove_system::<B>();
         ctx.flush_events();
     }
 }
