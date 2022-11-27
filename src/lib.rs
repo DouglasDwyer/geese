@@ -173,7 +173,7 @@ impl GeeseContext {
     }
 
     /// Obtains a reference to the given system.
-    pub fn system<S: GeeseSystem>(&self) -> SystemRef<'_, S> {
+    pub fn system<S: GeeseSystem>(&mut self) -> SystemRef<'_, S> {
         self.reload_dirty_systems();
         SystemRef::new(Ref::map(self.inner.systems(), |x|
             x.get(&TypeId::of::<S>()).expect("System not found.")
