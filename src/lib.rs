@@ -172,20 +172,9 @@ impl GeeseContext {
         }
     }
 
-    /// Immediately adds the specified system to the context.
-    pub fn add_system<S: GeeseSystem>(&mut self) {
-        self.queue_add_system(Arc::new(TypedSystemBuilder::<S>::new()));
-        self.reload_dirty_systems();
-    }
-
-    /// Immediately removes the specified system from the context.
-    pub fn remove_system<S: GeeseSystem>(&mut self) {
-        self.queue_remove_system(TypeId::of::<S>());
-        self.reload_dirty_systems();
-    }
-
     /// Obtains a reference to the given system.
     pub fn system<S: GeeseSystem>(&self) -> SystemRef<'_, S> {
+        self.reload_dirty_systems();
         SystemRef::new(Ref::map(self.inner.systems(), |x|
             x.get(&TypeId::of::<S>()).expect("System not found.")
                 .as_ref().expect("System was currently borrowed.")
@@ -194,6 +183,7 @@ impl GeeseContext {
 
     /// Mutably obtains a reference to the given system.
     pub fn system_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<'_, S> {
+        self.reload_dirty_systems();
         SystemRefMut::new(RefMut::map(self.inner.systems_mut(), |x|
             x.get_mut(&TypeId::of::<S>()).expect("System not found.")
                 .as_mut().expect("System was currently borrowed.")
