@@ -136,7 +136,7 @@ impl GeeseContextHandle {
     }
 
     /// Obtains the specified system dependency.
-    pub fn system<'a, T: GeeseSystem>(&'a self) -> SystemRef<'a, T> {
+    pub fn system<T: GeeseSystem>(&self) -> SystemRef<'_, T> {
         assert!(self.system.dependencies().iter().any(|x| x.system_id() == TypeId::of::<T>()), "The specified system was not a declared dependency of this one.");
         SystemRef::new(Ref::map(self.inner.systems(), |x| {
             let holder = x.get(&TypeId::of::<T>()).expect("System was not loaded.").as_ref().expect("Cannot obtain a reference to the current system.");
@@ -196,6 +196,16 @@ impl GeeseContext {
 
     /// Handles an event by broadcasting it to all systems.
     fn handle_event(&mut self, event: &dyn Any) {
+        self.handle_geese_event(event);
+        for id in self.system_ids() {
+            let mut system = std::mem::replace(self.inner.systems_mut().get_mut(&id).expect("Key was not found in map."), None);
+            system.as_mut().expect("Attempted to send events to a borrowed system.").apply_event(event);
+            self.inner.systems_mut().insert(id, system);
+        }
+    }
+
+    /// Processes the logic for builtin Geese events.
+    fn handle_geese_event(&mut self, event: &dyn Any) {
         if event.type_id() == TypeId::of::<notify::AddSystem>() {
             self.add_system(event.downcast_ref::<notify::AddSystem>().expect("Event type ID did not match type").builder.clone());
         }
@@ -205,11 +215,8 @@ impl GeeseContext {
         else if event.type_id() == TypeId::of::<notify::ResetSystem>() {
             self.reload_system(event.downcast_ref::<notify::ResetSystem>().expect("Event type ID did not match type").type_id);
         }
-
-        for id in self.system_ids() {
-            let mut system = std::mem::replace(self.inner.systems_mut().get_mut(&id).expect("Key was not found in map."), None);
-            system.as_mut().expect("Attempted to send events to a borrowed system.").apply_event(&*event);
-            self.inner.systems_mut().insert(id, system);
+        else if event.type_id() == TypeId::of::<notify::Delayed>() {
+            self.raise_event(event.downcast_ref::<notify::Delayed>().expect("Event type ID did not match type").0.replace(None).expect("Delayed event was already taken."));
         }
     }
 
@@ -226,6 +233,9 @@ impl GeeseContext {
             .expect("Cannot deactive systems due to a cyclic dependency.");
 
         for system in &activation_order {
+            // We need to re-borrow the system here, because otherwise we would have a mutable reference out to the
+            // systems map while a new system is being created (during which it may reference the system map).
+            #[allow(clippy::map_entry)]
             if !self.inner.systems_mut().contains_key(&system.system_id()) {
                 let holder = SystemHolder::new(self.inner.clone(), system.clone());
                 self.inner.systems_mut().insert(system.system_id(), Some(holder));
@@ -233,7 +243,7 @@ impl GeeseContext {
         }
 
         for system in deactivation_order.iter().rev() {
-            if !activation_order.iter().map(|x| (**x).system_id()).collect::<Vec<_>>().contains(&system.system_id()) {
+            if !activation_order.iter().any(|x| x.system_id() == system.system_id()) {
                 drop(self.inner.systems_mut().remove(&system.system_id()));
             }
         }
@@ -241,9 +251,12 @@ impl GeeseContext {
 
     /// Reloads the specified system and all of its dependencies.
     fn reload_system(&mut self, system_id: TypeId) {
-        for system in Self::determine_system_order(self.determine_dependent_system_list(system_id)).expect("Cyclic dependency between systems occurred.").into_iter().rev() {
-            self.inner.systems_mut().insert(system.system_id(), None).expect("Replaced empty system.");
-            
+        let system_reload_order = self.determine_dependent_system_reload_order(system_id);
+        for system in system_reload_order.iter().rev() {
+            self.inner.systems_mut().insert(system.system_id(), None).expect("Replaced empty system.");   
+        }
+
+        for system in &system_reload_order {
             let holder = SystemHolder::new(self.inner.clone(), system.clone());
             self.inner.systems_mut().insert(system.system_id(), Some(holder));
         }
@@ -264,23 +277,23 @@ impl GeeseContext {
         self.reload_systems();
     }
 
-    /// Determines the set of all systems that depend upon this one.
-    fn determine_dependent_system_list(&mut self, system_id: TypeId) -> impl Iterator<Item = Arc<dyn SystemBuilder>> {
+    /// Determines the order in which dependent systems should be reloaded.
+    fn determine_dependent_system_reload_order(&mut self, system_id: TypeId) -> Vec<Arc<dyn SystemBuilder>> {
         let systems = self.inner.systems();
 
-        let mut set = HashSet::new();
-        set.insert(system_id);
+        let mut reload_order = Vec::new();
+        reload_order.push(systems[&system_id].as_ref().expect("System was already borrowed.").builder());
 
-        let keys = systems.keys().cloned().collect::<Vec<_>>();
+        let builders = systems.values().map(|x| x.as_ref().expect("System was already borrowed.").builder()).collect::<Vec<_>>();
         let mut finished = false;
         while !finished {
             finished = true;
-            for &system in &keys {
-                if !set.contains(&system) {
-                    for dependent in systems[&system].as_ref().expect("System was borrowed.").builder().dependencies() {
-                        if set.contains(&dependent.system_id()) {
+            for system in &builders {
+                if !reload_order.iter().any(|x| x.system_id() == system.system_id()) {
+                    for dependent in system.dependencies() {
+                        if reload_order.iter().any(|x| x.system_id() == dependent.system_id()) {
                             finished = false;
-                            set.insert(system);
+                            reload_order.push(system.clone());
                             break;
                         }
                     }
@@ -288,28 +301,29 @@ impl GeeseContext {
             }
         }
 
-        set.into_iter().map(|x| systems[&x].as_ref().expect("System was borrowed.").builder()).collect::<Vec<_>>().into_iter()
+        reload_order
     }
 
     /// Determines the topological load ordering for the set of systems and all of their dependencies. Returns
     /// none if a cyclic dependency is found.
     fn determine_system_order(systems: impl Iterator<Item = Arc<dyn SystemBuilder>>) -> Option<Vec<Arc<dyn SystemBuilder>>> {
         let mut ts = TopologicalSort::new();
-        let mut required_systems = HashSet::new();
-        let mut to_be_processed = systems.collect::<Vec<_>>();
-        while let Some(x) = to_be_processed.pop() {
-            ts.insert(x.clone());
-            for dependency in x.dependencies() {
-                if !required_systems.contains(&dependency.system_id()) {
-                    required_systems.insert(dependency.system_id());
+        let mut processed = HashSet::new();
+        let mut to_be_processed = systems.collect::<VecDeque<_>>();
+        while let Some(x) = to_be_processed.pop_front() {
+            if !processed.contains(&x.system_id()) {
+                processed.insert(x.system_id());
+                ts.insert(x.clone());
+                for dependency in x.dependencies() {
                     ts.add_dependency(dependency.clone(), x.clone());
+                    to_be_processed.push_back(dependency.clone());
                 }
-            }
+            }            
         }
 
         let count = ts.len();
         let output = ts.into_iter().collect::<Vec<_>>();
-        (count == output.len()).then(|| output)
+        (count == output.len()).then_some(output)
     }
 }
 
@@ -488,7 +502,7 @@ impl<'a, T> Deref for SystemRef<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &*self.inner
+        &self.inner
     }
 }
 
@@ -507,13 +521,13 @@ impl<'a, T> Deref for SystemRefMut<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &*self.inner
+        &self.inner
     }
 }
 
 impl<'a, T> DerefMut for SystemRefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.inner
+        &mut self.inner
     }
 }
 
@@ -557,6 +571,18 @@ pub mod notify {
         pub fn new<S: GeeseSystem>() -> Self {
             let type_id = TypeId::of::<S>();
             Self { type_id }
+        }
+    }
+
+    /// Causes the context to delay processing the given event during
+    /// the current flush cycle.
+    pub struct Delayed(pub(super) Cell<Option<Box<dyn Any>>>);
+
+    impl Delayed {
+        /// Tells the context to delay processing this event until all of the other events
+        /// placed into the queue before the next flush call have been processed.
+        pub fn new<T: 'static>(event: T) -> Self {
+            Self(Cell::new(Some(Box::new(event))))
         }
     }
 }
