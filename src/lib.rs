@@ -130,6 +130,11 @@ impl GeeseContextHandle {
         }
     }
 
+    /// Raises the specified dynamically-typed event.
+    pub fn raise_boxed_event(&self, event: Box<dyn Any>) {
+        self.inner.events_mut().push_back(event);
+    }
+
     /// Raises the specified event.
     pub fn raise_event<T: 'static>(&self, event: T) {
         self.inner.events_mut().push_back(Box::new(event));
@@ -159,7 +164,12 @@ pub struct GeeseContext {
 }
 
 impl GeeseContext {
-    /// Places the given event in the system event queue.
+    /// Places the given dynamically-typed event into the system event queue.
+    pub fn raise_boxed_event(&mut self, event: Box<dyn Any>) {
+        self.inner.events.borrow_mut().push_back(event);
+    }
+
+    /// Places the given event into the system event queue.
     pub fn raise_event<T: 'static>(&mut self, event: T) {
         self.inner.events.borrow_mut().push_back(Box::new(event));
     }
@@ -216,7 +226,7 @@ impl GeeseContext {
             self.reload_system(event.downcast_ref::<notify::ResetSystem>().expect("Event type ID did not match type").type_id);
         }
         else if event.type_id() == TypeId::of::<notify::Delayed>() {
-            self.raise_event(event.downcast_ref::<notify::Delayed>().expect("Event type ID did not match type").0.replace(None).expect("Delayed event was already taken."));
+            self.inner.events_mut().push_back(event.downcast_ref::<notify::Delayed>().expect("Event type ID did not match type").0.replace(None).expect("Delayed event was already taken."));
         }
     }
 
