@@ -95,8 +95,8 @@ pub struct GeeseSystemData<S: GeeseSystem + ?Sized> {
 
 impl<S: GeeseSystem> GeeseSystemData<S> {    
     /// Registers an event handler for the given system.
-    pub fn event<E: 'static>(&mut self, handler: fn(&mut S, &E)) {
-        self.events.push(Box::new(handler));
+    pub fn event<E: 'static, F: 'static + Fn(&mut S, &E)>(&mut self, handler: F) {
+        self.events.push(Box::new(TypedEventHandler::new(handler)));
     }
 
     /// Sets the given system as a dependency of this one.
@@ -176,8 +176,22 @@ impl GeeseContext {
 
     /// Causes an event cycle to complete by running systems until the event queue is empty.
     pub fn flush_events(&mut self) {
-        while let Some(event) = self.next_event() {
-            self.handle_event(&*event);
+        while self.events_in_queue() {
+            let mut inner_events = self.inner.events.borrow_mut();
+            let mut prior_queue = std::mem::take(&mut *inner_events);
+            drop(inner_events);
+
+            while let Some(event) = prior_queue.pop_front() {
+                if event.downcast_ref::<notify::Flush>().is_some() && self.events_in_queue() {
+                    prior_queue.push_front(Box::new(notify::Flush));
+                    
+                    for new_event in self.inner.events.borrow_mut().drain(..).rev() {
+                        prior_queue.push_front(new_event);
+                    }
+                }
+
+                self.handle_event(&*event);
+            }
         }
     }
 
@@ -199,9 +213,10 @@ impl GeeseContext {
                 .system_mut().downcast_mut().expect("System was not of the correct type.")))
     }
 
-    /// Gets the next event in the event queue.
-    fn next_event(&self) -> Option<Box<dyn Any>> {
-        self.inner.events.borrow_mut().pop_front()
+    /// Determines whether there are any events yet to be processed
+    /// in the main event queue.
+    fn events_in_queue(&self) -> bool {
+        !self.inner.events.borrow().is_empty()
     }
 
     /// Handles an event by broadcasting it to all systems.
@@ -483,7 +498,17 @@ trait EventHandler {
     fn respond(&self, system: &mut dyn Any, event: &dyn Any);
 }
 
-impl<S: GeeseSystem, E: 'static> EventHandler for fn(&mut S, &E) {
+/// Provides the ability to call a function in response to an event.
+struct TypedEventHandler<S: GeeseSystem, E: 'static, F>(F, PhantomData<(S, E)>) where F : Fn(&mut S, &E);
+
+impl<S: GeeseSystem, E: 'static, F: Fn(&mut S, &E)> TypedEventHandler<S, E, F> {
+    /// Creates a new event handler for the specified function.
+    pub fn new(f: F) -> Self {
+        Self(f, PhantomData::default())
+    }
+}
+
+impl<S: GeeseSystem, E: 'static, F: Fn(&mut S, &E)> EventHandler for TypedEventHandler<S, E, F> {
     fn system_id(&self) -> TypeId {
         TypeId::of::<S>()
     }
@@ -493,22 +518,29 @@ impl<S: GeeseSystem, E: 'static> EventHandler for fn(&mut S, &E) {
     }
 
     fn respond(&self, system: &mut dyn Any, event: &dyn Any) {
-        (self)(system.downcast_mut().expect("System was of the incorrect type."), event.downcast_ref().expect("Event was of the incorrect type."));
+        (self.0)(system.downcast_mut().expect("System was of the incorrect type."), event.downcast_ref().expect("Event was of the incorrect type."));
     }
 }
 
 /// Represents an immutable reference to a system.
-pub struct SystemRef<'a, T> {
+pub struct SystemRef<'a, T: ?Sized> {
     inner: Ref<'a, T>
 }
 
-impl<'a, T> SystemRef<'a, T> {
+impl<'a, T: ?Sized> SystemRef<'a, T> {
+    /// Creates a new immutable reference to a system from a
+    /// `std::cell::RefCell` borrow.
     fn new(inner: Ref<'a, T>) -> Self {
         Self { inner }
     }
+
+    /// Creates a reference to a specific borrowed component of a system.
+    pub fn map<U, F>(orig: SystemRef<'a, T>, f: F) -> SystemRef<'a, U> where F: FnOnce(&T) -> &U, U: ?Sized {
+        SystemRef::new(Ref::map(orig.inner, f))
+    }
 }
 
-impl<'a, T> Deref for SystemRef<'a, T> {
+impl<'a, T: ?Sized> Deref for SystemRef<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -517,17 +549,24 @@ impl<'a, T> Deref for SystemRef<'a, T> {
 }
 
 /// Represents a mutable reference to a system.
-pub struct SystemRefMut<'a, T> {
+pub struct SystemRefMut<'a, T: ?Sized> {
     inner: RefMut<'a, T>
 }
 
-impl<'a, T> SystemRefMut<'a, T> {
+impl<'a, T: ?Sized> SystemRefMut<'a, T> {
+    /// Creates a new mutable reference to a system from a
+    /// `std::cell::RefCell` borrow.
     fn new(inner: RefMut<'a, T>) -> Self {
         Self { inner }
     }
+
+    /// Creates a reference to a specific borrowed component of a system.
+    pub fn map<U, F>(orig: SystemRefMut<'a, T>, f: F) -> SystemRefMut<'a, U> where F: FnOnce(&mut T) -> &mut U, U: ?Sized {
+        SystemRefMut::new(RefMut::map(orig.inner, f))
+    }
 }
 
-impl<'a, T> Deref for SystemRefMut<'a, T> {
+impl<'a, T: ?Sized> Deref for SystemRefMut<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -535,7 +574,7 @@ impl<'a, T> Deref for SystemRefMut<'a, T> {
     }
 }
 
-impl<'a, T> DerefMut for SystemRefMut<'a, T> {
+impl<'a, T: ?Sized> DerefMut for SystemRefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
@@ -595,6 +634,10 @@ pub mod notify {
             Self(Cell::new(Some(Box::new(event))))
         }
     }
+
+    /// Instructs the Geese context to process all events that were
+    /// raised until this point in the queue before moving on.
+    pub struct Flush;
 }
 
 #[cfg(test)]
