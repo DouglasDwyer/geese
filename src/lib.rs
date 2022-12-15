@@ -67,6 +67,10 @@
 //! }
 //! ```
 
+mod store;
+
+pub use crate::store::*;
+
 use std::any::*;
 use std::cell::*;
 use std::collections::*;
