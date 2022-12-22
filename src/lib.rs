@@ -273,7 +273,8 @@ impl GeeseContext {
 
         for system in deactivation_order.iter().rev() {
             if !activation_order.iter().any(|x| x.system_id() == system.system_id()) {
-                drop(self.inner.systems_mut().remove(&system.system_id()));
+                let removed = self.inner.systems_mut().remove(&system.system_id());
+                drop(removed);
             }
         }
     }
@@ -282,7 +283,8 @@ impl GeeseContext {
     fn reload_system(&mut self, system_id: TypeId) {
         let system_reload_order = self.determine_dependent_system_reload_order(system_id);
         for system in system_reload_order.iter().rev() {
-            self.inner.systems_mut().insert(system.system_id(), None).expect("Replaced empty system.");   
+            let removed = self.inner.systems_mut().insert(system.system_id(), None).expect("Replaced empty system.");
+            drop(removed);
         }
 
         for system in &system_reload_order {
