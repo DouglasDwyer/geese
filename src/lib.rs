@@ -71,6 +71,7 @@ mod store;
 
 pub use crate::store::*;
 
+use fxhash::*;
 use std::any::*;
 use std::cell::*;
 use std::collections::*;
@@ -82,6 +83,9 @@ use std::ops::*;
 
 use topological_sort::*;
 
+/// Represents a mapping between type IDs and a value.
+type TypeMap<T> = FxHashMap<TypeId, T>;
+
 /// Represents a collection of event handlers with internal state.
 pub trait GeeseSystem: 'static {
     /// Creates a new instance of the system for the given system handle.
@@ -92,21 +96,21 @@ pub trait GeeseSystem: 'static {
 
 /// Stores event handler data for a system.
 pub struct GeeseSystemData<S: GeeseSystem + ?Sized> {
-    dependencies: HashMap<TypeId, Box<dyn SystemBuilder>>,
-    events: Vec<Box<dyn EventHandler>>,
+    dependencies: TypeMap<Box<dyn SystemBuilder>>,
+    events: Vec<Arc<dyn EventHandler>>,
     phantom: PhantomData<S>
 }
 
 impl<S: GeeseSystem> GeeseSystemData<S> {    
     /// Registers an event handler for the given system.
     pub fn event<E: 'static, F: 'static + Fn(&mut S, &E)>(&mut self, handler: F) {
-        self.events.push(Box::new(TypedEventHandler::new(handler)));
+        self.events.push(Arc::new(TypedEventHandler::new(handler)));
     }
 
     /// Sets the given system as a dependency of this one.
     pub fn dependency<Q: GeeseSystem>(&mut self) {
         let builder = Box::new(TypedSystemBuilder::<Q>::new());
-        assert!(self.dependencies.insert(builder.system_id(), builder).is_none(), "Cannot add duplicate dependencies");
+        assert!(self.dependencies.insert(builder.system_id(), builder).is_none(), "Cannot add duplicate dependencies.");
     }
 
     /// Creates a new, empty system data holder.
@@ -163,7 +167,8 @@ impl Debug for GeeseContextHandle {
 /// Represents a collection of systems that can create and respond to events.
 #[derive(Default)]
 pub struct GeeseContext {
-    active_systems: HashMap<TypeId, Arc<dyn SystemBuilder>>,
+    active_systems: TypeMap<Arc<dyn SystemBuilder>>,
+    event_map: TypeMap<Vec<Arc<dyn EventHandler>>>,
     inner: InnerContext,
 }
 
@@ -226,10 +231,10 @@ impl GeeseContext {
     /// Handles an event by broadcasting it to all systems.
     fn handle_event(&mut self, event: &dyn Any) {
         self.handle_geese_event(event);
-        for id in self.system_ids() {
-            let mut system = std::mem::replace(self.inner.systems_mut().get_mut(&id).expect("Key was not found in map."), None);
-            system.as_mut().expect("Attempted to send events to a borrowed system.").apply_event(event);
-            self.inner.systems_mut().insert(id, system);
+        for handler in self.event_map.get(&event.type_id()).unwrap_or(&Vec::new()) {
+            let mut system = std::mem::replace(self.inner.systems_mut().get_mut(&handler.system_id()).expect("Key was not found in map."), None);
+            handler.respond(system.as_mut().expect("Attempted to send events to a borrowed system.").system_mut(), event);
+            self.inner.systems_mut().insert(handler.system_id(), system);
         }
     }
 
@@ -247,11 +252,6 @@ impl GeeseContext {
         else if event.type_id() == TypeId::of::<notify::Delayed>() {
             self.inner.events_mut().push_back(event.downcast_ref::<notify::Delayed>().expect("Event type ID did not match type").0.replace(None).expect("Delayed event was already taken."));
         }
-    }
-
-    /// Obtains the IDs of all currently-loaded systems.
-    fn system_ids(&self) -> impl Iterator<Item = TypeId> {
-        self.inner.systems().keys().cloned().collect::<Vec<_>>().into_iter()
     }
     
     /// Activates and deactivates the appropriate systems if they have changed.
@@ -277,6 +277,8 @@ impl GeeseContext {
                 drop(removed);
             }
         }
+
+        self.update_event_map(&activation_order[..]);
     }
 
     /// Reloads the specified system and all of its dependencies.
@@ -335,6 +337,18 @@ impl GeeseContext {
         reload_order
     }
 
+    /// Updates the event-dispatching acceleration structure with the event handlers
+    /// for all currently-loaded systems.
+    fn update_event_map(&mut self, systems: &[Arc<dyn SystemBuilder>]) {
+        self.event_map = TypeMap::default();
+
+        for system in systems {
+            for event in system.event_responders() {
+                self.event_map.entry(event.event_id()).or_default().push(event.clone());
+            }
+        }
+    }
+
     /// Determines the topological load ordering for the set of systems and all of their dependencies. Returns
     /// none if a cyclic dependency is found.
     fn determine_system_order(systems: impl Iterator<Item = Arc<dyn SystemBuilder>>) -> Option<Vec<Arc<dyn SystemBuilder>>> {
@@ -368,7 +382,7 @@ impl Debug for GeeseContext {
 #[derive(Clone, Default)]
 struct InnerContext {
     events: Arc<RefCell<VecDeque<Box<dyn Any>>>>,
-    systems: Arc<RefCell<HashMap<TypeId, Option<SystemHolder>>>>
+    systems: Arc<RefCell<TypeMap<Option<SystemHolder>>>>
 }
 
 impl InnerContext {
@@ -378,12 +392,12 @@ impl InnerContext {
     }
 
     /// Obtains the system list. This will panic if it was already mutably borrowed.
-    pub fn systems(&self) -> Ref<'_, HashMap<TypeId, Option<SystemHolder>>> {
+    pub fn systems(&self) -> Ref<'_, TypeMap<Option<SystemHolder>>> {
         self.systems.borrow()
     }
 
     /// Mutably obtains the system list. This will panic if it was already borrowed.
-    pub fn systems_mut(&self) -> RefMut<'_, HashMap<TypeId, Option<SystemHolder>>> {
+    pub fn systems_mut(&self) -> RefMut<'_, TypeMap<Option<SystemHolder>>> {
         self.systems.borrow_mut()
     }
 }
@@ -415,13 +429,6 @@ impl SystemHolder {
     pub fn system_mut(&mut self) -> &mut dyn Any {
         &mut *self.system
     }
-
-    /// Causes the system to respond to the current event.
-    pub fn apply_event(&mut self, event: &dyn Any) {
-        for resp in self.builder.event_responders(event.type_id()) {
-            resp.respond(&mut *self.system, event);
-        }
-    }
 }
 
 /// Stores information about system construction, dependencies, and event handlers.
@@ -431,7 +438,7 @@ trait SystemBuilder {
     /// Obtains builders for any dependencies of this system.
     fn dependencies(&self) -> &[Arc<dyn SystemBuilder>];
     /// Obtains all of the event handlers for the given event ID associated with this system.
-    fn event_responders(&self, event_id: TypeId) -> &[Box<dyn EventHandler>];
+    fn event_responders(&self) -> &[Arc<dyn EventHandler>];
     /// Creates a new instance of this system for the given context handle.
     fn build(&self, ctx: GeeseContextHandle) -> Box<dyn Any>;
 }
@@ -452,7 +459,7 @@ impl Hash for dyn SystemBuilder {
 /// Stores typed information for system construction and dependencies.
 struct TypedSystemBuilder<S: GeeseSystem> {
     dependencies: Vec<Arc<dyn SystemBuilder>>,
-    event_handlers: HashMap<TypeId, Vec<Box<dyn EventHandler>>>,
+    event_handlers: Vec<Arc<dyn EventHandler>>,
     phantom: PhantomData<S>
 }
 
@@ -462,15 +469,10 @@ impl<S: GeeseSystem> TypedSystemBuilder<S> {
         let mut entry = GeeseSystemData::new();
         S::register(&mut entry);
         let dependencies = entry.dependencies.into_iter().map(|(_, x)| Arc::from(x)).collect();
-        let mut event_handlers: HashMap<_, Vec<Box<dyn EventHandler>>> = HashMap::new();
-
-        for event in entry.events {
-            event_handlers.entry(event.event_id()).or_default().push(event);
-        }
 
         Self {
             dependencies,
-            event_handlers,
+            event_handlers: entry.events,
             phantom: Default::default()
         }
     }
@@ -485,8 +487,8 @@ impl<S: GeeseSystem> SystemBuilder for TypedSystemBuilder<S> {
         &self.dependencies[..]
     }
 
-    fn event_responders(&self, event_id: TypeId) -> &[Box<dyn EventHandler>] {
-        self.event_handlers.get(&event_id).map(|x| &x[..]).unwrap_or(&[])
+    fn event_responders(&self) -> &[Arc<dyn EventHandler>] {
+        &self.event_handlers[..]
     }
 
     fn build(&self, ctx: GeeseContextHandle) -> Box<dyn Any> {
