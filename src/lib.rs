@@ -378,6 +378,15 @@ impl Debug for GeeseContext {
     }
 }
 
+impl Drop for GeeseContext {
+    fn drop(&mut self) {
+        let ids = self.active_systems.keys().cloned().collect::<Vec<_>>();
+        for system_id in ids {
+            self.remove_system(system_id);
+        }
+    }
+}
+
 /// Stores shared information about a Geese context.
 #[derive(Clone, Default)]
 struct InnerContext {
