@@ -367,7 +367,7 @@ impl GeeseContext {
         }
 
         let count = ts.len();
-        let output = ts.into_iter().collect::<Vec<_>>();
+        let output = ts.collect::<Vec<_>>();
         (count == output.len()).then_some(output)
     }
 }
@@ -477,7 +477,7 @@ impl<S: GeeseSystem> TypedSystemBuilder<S> {
     pub fn new() -> Self {
         let mut entry = GeeseSystemData::new();
         S::register(&mut entry);
-        let dependencies = entry.dependencies.into_iter().map(|(_, x)| Arc::from(x)).collect();
+        let dependencies = entry.dependencies.into_values().map(Arc::from).collect();
 
         Self {
             dependencies,
