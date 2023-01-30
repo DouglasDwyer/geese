@@ -12,7 +12,7 @@
 //! The following is an example of how to use Geese to load multiple dependent systems,
 //! and propogate events between them. The example creates a Geese context,
 //! and requests that system `B` be loaded. When `flush_events` is called,
-//! system `A` is loaded first (beause it is a dependency of `B`), and then
+//! system `A` is loaded first (because it is a dependency of `B`), and then
 //! system `B` is loaded. `B` receives the typed event, and responds by querying
 //! system `A` for some information.
 //! 
