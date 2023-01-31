@@ -283,13 +283,13 @@ impl GeeseContext {
 
     /// Reloads the specified system and all of its dependencies.
     fn reload_system(&mut self, system_id: TypeId) {
-        let system_reload_order = self.determine_dependent_system_reload_order(system_id);
-        for system in system_reload_order.iter().rev() {
+        let system_unload_order = self.determine_dependent_system_unload_order(system_id);
+        for system in &system_unload_order {
             let removed = self.inner.systems_mut().insert(system.system_id(), None).expect("Replaced empty system.");
             drop(removed);
         }
 
-        for system in &system_reload_order {
+        for system in system_unload_order.iter().rev() {
             let holder = SystemHolder::new(self.inner.clone(), system.clone());
             self.inner.systems_mut().insert(system.system_id(), Some(holder));
         }
@@ -310,31 +310,29 @@ impl GeeseContext {
         self.reload_systems();
     }
 
-    /// Determines the order in which dependent systems should be reloaded.
-    fn determine_dependent_system_reload_order(&mut self, system_id: TypeId) -> Vec<Arc<dyn SystemBuilder>> {
+    /// Determines the order in which dependent systems should be unloaded.
+    fn determine_dependent_system_unload_order(&mut self, system_id: TypeId) -> Vec<Arc<dyn SystemBuilder>> {
         let systems = self.inner.systems();
 
-        let mut reload_order = Vec::new();
-        reload_order.push(systems[&system_id].as_ref().expect("System was already borrowed.").builder());
+        let mut reload_order = TopologicalSort::<Arc<dyn SystemBuilder>>::new();
+        reload_order.insert(systems[&system_id].as_ref().expect("System was already borrowed.").builder());
 
         let builders = systems.values().map(|x| x.as_ref().expect("System was already borrowed.").builder()).collect::<Vec<_>>();
         let mut finished = false;
         while !finished {
             finished = true;
+            let order = reload_order.clone().collect::<Vec<_>>();
             for system in &builders {
-                if !reload_order.iter().any(|x| x.system_id() == system.system_id()) {
-                    for dependent in system.dependencies() {
-                        if reload_order.iter().any(|x| x.system_id() == dependent.system_id()) {
-                            finished = false;
-                            reload_order.push(system.clone());
-                            break;
-                        }
+                if !order.iter().any(|x| x.system_id() == system.system_id()) {
+                    if let Some(dependent) = system.dependencies().iter().filter(|dependent| order.iter().any(|x| x.system_id() == dependent.system_id())).next() {
+                        finished = false;
+                        reload_order.add_dependency(system.clone(), dependent.clone());
                     }
                 }
             }
         }
 
-        reload_order
+        reload_order.collect::<Vec<_>>()
     }
 
     /// Updates the event-dispatching acceleration structure with the event handlers
