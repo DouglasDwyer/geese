@@ -49,10 +49,10 @@ impl GeeseSystem for B {
         Self { ctx }
     }
 
-    fn register(entry: &mut GeeseSystemData<Self>) {
-        entry.dependency::<A>();
+    fn register(with: &mut GeeseSystemData<Self>) {
+        with.dependency::<A>();
 
-        entry.event(Self::test_answer);
+        with.event(Self::test_answer);
     }
 }
 

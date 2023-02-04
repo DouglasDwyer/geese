@@ -50,10 +50,10 @@
 //!         Self { ctx }
 //!     }
 //! 
-//!     fn register(entry: &mut GeeseSystemData<Self>) {
-//!         entry.dependency::<A>();
+//!     fn register(with: &mut GeeseSystemData<Self>) {
+//!         with.dependency::<A>();
 //! 
-//!         entry.event(Self::test_answer);
+//!         with.event(Self::test_answer);
 //!     }
 //! }
 //! 
@@ -314,25 +314,46 @@ impl GeeseContext {
     fn determine_dependent_system_unload_order(&mut self, system_id: TypeId) -> Vec<Arc<dyn SystemBuilder>> {
         let systems = self.inner.systems();
 
-        let mut reload_order = TopologicalSort::<Arc<dyn SystemBuilder>>::new();
-        reload_order.insert(systems[&system_id].as_ref().expect("System was already borrowed.").builder());
+        let reloading_systems = Self::systems_to_unload(&systems, system_id);
 
+        let mut reload_order = TopologicalSort::new();
+
+        for sys in reloading_systems.iter().cloned() {
+            reload_order.insert(sys);
+        }
+
+        let reload_ref = &reloading_systems;
+        for (sys, dep) in reloading_systems.iter().flat_map(|sys|
+            sys.dependencies().iter().filter_map(move |dep| (reload_ref.contains(dep)).then_some((sys, dep)))) {
+            reload_order.add_dependency(sys.clone(), dep.clone());
+        }
+
+        reload_order.collect()
+    }
+
+    /// Determines the subset of systems which need to be reloaded in an arbitrary order.
+    fn systems_to_unload(systems: &FxHashMap<TypeId, Option<SystemHolder>>, system_id: TypeId) -> Vec<Arc<dyn SystemBuilder>> {
+        let mut reloading_systems = Vec::new();
+        reloading_systems.push(systems[&system_id].as_ref().expect("System was already borrowed.").builder());
+    
         let builders = systems.values().map(|x| x.as_ref().expect("System was already borrowed.").builder()).collect::<Vec<_>>();
         let mut finished = false;
         while !finished {
             finished = true;
-            let order = reload_order.clone().collect::<Vec<_>>();
             for system in &builders {
-                if !order.iter().any(|x| x.system_id() == system.system_id()) {
-                    if let Some(dependent) = system.dependencies().iter().filter(|dependent| order.iter().any(|x| x.system_id() == dependent.system_id())).next() {
-                        finished = false;
-                        reload_order.add_dependency(system.clone(), dependent.clone());
+                if !reloading_systems.iter().any(|x| x.system_id() == system.system_id()) {
+                    for dependent in system.dependencies() {
+                        if reloading_systems.iter().any(|x| x.system_id() == dependent.system_id()) {
+                            finished = false;
+                            reloading_systems.push(system.clone());
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        reload_order.collect::<Vec<_>>()
+        reloading_systems
     }
 
     /// Updates the event-dispatching acceleration structure with the event handlers
@@ -678,8 +699,8 @@ mod tests {
             Self
         }
 
-        fn register(entry: &mut GeeseSystemData<Self>) {
-            entry.event(Self::increment);
+        fn register(with: &mut GeeseSystemData<Self>) {
+            with.event(Self::increment);
         }
     }
 
@@ -699,34 +720,48 @@ mod tests {
             Self { ctx }
         }
 
-        fn register(entry: &mut GeeseSystemData<Self>) {
-            entry.dependency::<A>();
+        fn register(with: &mut GeeseSystemData<Self>) {
+            with.dependency::<A>();
 
-            entry.event(Self::test_answer);
+            with.event(Self::test_answer);
         }
     }
 
     struct C {
-        counter: usize
+        counter: AtomicUsize
     }
 
     impl C {
         pub fn counter(&self) -> usize {
-            self.counter
+            self.counter.load(Ordering::Acquire)
         }
 
         fn increment_counter(&mut self, _: &()) {
-            self.counter += 1;
+            self.counter.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     impl GeeseSystem for C {
         fn new(_: GeeseContextHandle) -> Self {
-            Self { counter: 0 }
+            Self { counter: AtomicUsize::new(0) }
         }
 
         fn register(with: &mut GeeseSystemData<Self>) {
             with.event(Self::increment_counter);
+        }
+    }
+
+    struct D;
+
+    impl GeeseSystem for D {
+        fn new(ctx: GeeseContextHandle) -> Self {
+            ctx.system::<C>().counter.store(4, Ordering::Release);
+            Self
+        }
+
+        fn register(with: &mut GeeseSystemData<Self>) {
+            with.dependency::<A>();
+            with.dependency::<C>();
         }
     }
 
@@ -758,6 +793,16 @@ mod tests {
         assert_eq!(ctx.system::<C>().counter(), 1);
         ctx.raise_event(notify::ResetSystem::new::<A>());
         assert_eq!(ctx.system::<C>().counter(), 2);
+    }
+
+    #[test]
+    fn test_system_reload_order() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::AddSystem::new::<D>());
+        ctx.raise_event(notify::AddSystem::new::<B>());
+        assert_eq!(ctx.system::<C>().counter(), 5);
+        ctx.raise_event(notify::ResetSystem::new::<A>());
+        assert_eq!(ctx.system::<C>().counter(), 5);
     }
 
     #[test]
