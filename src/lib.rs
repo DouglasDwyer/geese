@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 //! Geese is a game event system for Rust, built to allow modular game engine design.
 //!
 //! In Geese, a system is a struct with internal state and a collection of associated
@@ -65,6 +63,8 @@
 //! assert!(ab.load(Ordering::Relaxed));
 //! ```
 
+#![deny(warnings)]
+
 mod store;
 
 pub use crate::store::*;
@@ -78,7 +78,6 @@ use std::hash::*;
 use std::marker::*;
 use std::sync::*;
 use std::ops::*;
-
 use topological_sort::*;
 
 /// Represents a mapping between type IDs and a value.
