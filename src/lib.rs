@@ -57,7 +57,7 @@
 //! 
 //! let ab = Arc::new(AtomicBool::new(false));
 //! let mut ctx = GeeseContext::default();
-//! ctx.raise_event(notify::AddSystem::new::<B>());
+//! ctx.raise_event(notify::add_system::<B>());
 //! ctx.raise_event(ab.clone());
 //! ctx.flush_events();
 //! assert!(ab.load(Ordering::Relaxed));
@@ -88,7 +88,8 @@ pub trait GeeseSystem: 'static {
     /// Creates a new instance of the system for the given system handle.
     fn new(ctx: GeeseContextHandle) -> Self;
     /// Registers the event handlers and dependencies of this system.
-    fn register(_: &mut GeeseSystemData<Self>) {}
+    #[allow(unused_variables)]
+    fn register(with: &mut GeeseSystemData<Self>) {}
 }
 
 /// Stores event handler data for a system.
@@ -106,8 +107,10 @@ impl<S: GeeseSystem> GeeseSystemData<S> {
 
     /// Sets the given system as a dependency of this one.
     pub fn dependency<Q: GeeseSystem>(&mut self) {
-        let builder = Box::new(TypedSystemBuilder::<Q>::new());
-        assert!(self.dependencies.insert(builder.system_id(), builder).is_none(), "Cannot add duplicate dependencies.");
+        // We defer the system registration cycle for dependencies, because otherwise cyclic dependencies cause
+        // an infinite recursion and stack overflow.
+        let builder = Box::new(DeferredSystemBuilder::new(TypedSystemBuilder::<Q>::new));
+        assert!(self.dependencies.insert(TypeId::of::<Q>(), builder).is_none(), "Cannot add duplicate dependencies.");
     }
 
     /// Creates a new, empty system data holder.
@@ -521,6 +524,47 @@ impl<S: GeeseSystem> SystemBuilder for TypedSystemBuilder<S> {
     }
 }
 
+struct DeferredSystemBuilder<S: SystemBuilder, F: Fn() -> S> {
+    get_builder: F,
+    builder: once_cell::race::OnceBox<S>
+}
+
+impl<S: SystemBuilder, F: Fn() -> S> DeferredSystemBuilder<S, F> {
+    /// Creates a new deferred system builder that utilizes the specified creation
+    /// function to generate the builder when necessary.
+    pub fn new(get_builder: F) -> Self {
+        let builder = once_cell::race::OnceBox::new();
+        Self {
+            get_builder,
+            builder
+        }
+    }
+
+    /// Obtains the builder associated with this object, initializing it
+    /// using the builder creation function if it has not already been created.
+    fn builder(&self) -> &S {
+        self.builder.get_or_init(|| Box::new((self.get_builder)()))
+    }
+}
+
+impl<S: SystemBuilder, F: Fn() -> S> SystemBuilder for DeferredSystemBuilder<S, F> {
+    fn system_id(&self) -> TypeId {
+        self.builder().system_id()
+    }
+
+    fn dependencies(&self) -> &[Arc<dyn SystemBuilder>] {
+        self.builder().dependencies()
+    }
+
+    fn event_responders(&self) -> &[Arc<dyn EventHandler>] {
+        self.builder().event_responders()
+    }
+
+    fn build(&self, ctx: GeeseContextHandle) -> Box<dyn Any> {
+        self.builder().build(ctx)
+    }
+}
+
 /// Provides the ability to handle a strongly-typed event for a system.
 trait EventHandler {
     /// The system ID of the event.
@@ -622,12 +666,10 @@ pub mod notify {
         pub(super) builder: Arc<dyn SystemBuilder>
     }
 
-    impl AddSystem {
-        /// Tells Geese to load the specified system when this event triggers.
-        pub fn new<S: GeeseSystem>() -> Self {
-            let builder = Arc::new(TypedSystemBuilder::<S>::new());
-            Self { builder }
-        }
+    /// Tells Geese to load the specified system when this event triggers.
+    pub fn add_system<S: GeeseSystem>() -> AddSystem {
+        let builder = Arc::new(TypedSystemBuilder::<S>::new());
+        AddSystem { builder }
     }
 
     /// Causes Geese to remove a system during the next event cycle. The context will panic if the system was not present.
@@ -635,37 +677,31 @@ pub mod notify {
         pub(super) type_id: TypeId
     }
 
-    impl RemoveSystem {
-        /// Tells Geese to unload the specified system when this event triggers.
-        pub fn new<S: GeeseSystem>() -> Self {
-            let type_id = TypeId::of::<S>();
-            Self { type_id }
-        }
-    }
-
     /// Causes Geese to reload a system during the next event cycle. The context will panic if the system was not present.
     pub struct ResetSystem {
         pub(super) type_id: TypeId
     }
 
-    impl ResetSystem {
-        /// Tells Geese to reset the specified system when this event triggers.
-        pub fn new<S: GeeseSystem>() -> Self {
-            let type_id = TypeId::of::<S>();
-            Self { type_id }
-        }
+    /// Tells Geese to unload the specified system when this event triggers.
+    pub fn remove_system<S: GeeseSystem>() -> RemoveSystem {
+        let type_id = TypeId::of::<S>();
+        RemoveSystem { type_id }
+    }
+
+    /// Tells Geese to reset the specified system when this event triggers.
+    pub fn reset_system<S: GeeseSystem>() -> ResetSystem {
+        let type_id = TypeId::of::<S>();
+        ResetSystem { type_id }
     }
 
     /// Causes the context to delay processing the given event during
     /// the current flush cycle.
     pub struct Delayed(pub(super) Cell<Option<Box<dyn Any>>>);
 
-    impl Delayed {
-        /// Tells the context to delay processing this event until all of the other events
-        /// placed into the queue before the next flush call have been processed.
-        pub fn new<T: 'static>(event: T) -> Self {
-            Self(Cell::new(Some(Box::new(event))))
-        }
+    /// Tells the context to delay processing this event until all of the other events
+    /// placed into the queue before the next flush call have been processed.
+    pub fn delayed<T: 'static>(event: T) -> Delayed {
+        Delayed(Cell::new(Some(Box::new(event))))
     }
 
     /// Instructs the Geese context to process all events that were
@@ -766,7 +802,7 @@ mod tests {
     fn test_single_system() {
         let ab = Arc::new(AtomicUsize::new(0));
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::AddSystem::new::<A>());
+        ctx.raise_event(notify::add_system::<A>());
         ctx.raise_event(ab.clone());
         ctx.flush_events();
         assert!(ab.load(Ordering::Relaxed) == 1);
@@ -776,7 +812,7 @@ mod tests {
     fn test_dependent_system() {
         let ab = Arc::new(AtomicBool::new(false));
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::AddSystem::new::<B>());
+        ctx.raise_event(notify::add_system::<B>());
         ctx.raise_event(ab.clone());
         ctx.flush_events();
         assert!(ab.load(Ordering::Relaxed));
@@ -785,20 +821,20 @@ mod tests {
     #[test]
     fn test_system_reload() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::AddSystem::new::<C>());
-        ctx.raise_event(notify::AddSystem::new::<B>());
+        ctx.raise_event(notify::add_system::<C>());
+        ctx.raise_event(notify::add_system::<B>());
         assert_eq!(ctx.system::<C>().counter(), 1);
-        ctx.raise_event(notify::ResetSystem::new::<A>());
+        ctx.raise_event(notify::reset_system::<A>());
         assert_eq!(ctx.system::<C>().counter(), 2);
     }
 
     #[test]
     fn test_system_reload_order() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::AddSystem::new::<D>());
-        ctx.raise_event(notify::AddSystem::new::<B>());
+        ctx.raise_event(notify::add_system::<D>());
+        ctx.raise_event(notify::add_system::<B>());
         assert_eq!(ctx.system::<C>().counter(), 5);
-        ctx.raise_event(notify::ResetSystem::new::<A>());
+        ctx.raise_event(notify::reset_system::<A>());
         assert_eq!(ctx.system::<C>().counter(), 5);
     }
 
@@ -806,8 +842,8 @@ mod tests {
     #[should_panic]
     fn test_add_system_event_twice_panic() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::AddSystem::new::<B>());
-        ctx.raise_event(notify::AddSystem::new::<B>());
+        ctx.raise_event(notify::add_system::<B>());
+        ctx.raise_event(notify::add_system::<B>());
         ctx.flush_events();
     }
 
@@ -815,7 +851,7 @@ mod tests {
     #[should_panic]
     fn test_remove_system_event_unknown_panic() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::RemoveSystem::new::<B>());
+        ctx.raise_event(notify::remove_system::<B>());
         ctx.flush_events();
     }
 }

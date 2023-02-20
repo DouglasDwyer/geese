@@ -1,6 +1,6 @@
 [package]
 name = "geese"
-version = "0.1.15"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/geese"
@@ -11,4 +11,5 @@ Dead-simple game event system for Rust.
 
 [dependencies]
 fxhash = "0.2.1"
+once_cell = ">=1.16"
 topological-sort = "0.2.2"
