@@ -10,6 +10,11 @@ Dead-simple game event system for Rust.
 """
 
 [dependencies]
+bitvec = "1.0.1"
 fxhash = "0.2.1"
-once_cell = ">=1.16"
+smallvec = "1.11.0"
 topological-sort = "0.2.2"
+
+[features]
+default = [ "static_check" ]
+static_check = []
