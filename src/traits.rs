@@ -177,6 +177,7 @@ pub(super) trait SystemDescriptor: 'static + Send + Sync {
     fn create(&self, inner: Arc<ContextHandleInner>) -> Box<dyn Any>;
     fn create_handle_data(&self, context_id: u16) -> Arc<ContextHandleInner>;
     fn dependencies(&self) -> &'static Dependencies;
+    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler>;
     fn system_id(&self) -> TypeId;
 }
 
@@ -202,30 +203,34 @@ impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
         &S::DEPENDENCIES
     }
 
+    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler> {
+        &S::EVENT_HANDLERS.0
+    }
+
     fn system_id(&self) -> TypeId {
         TypeId::of::<S>()
     }
 }
 
-pub struct EventHandlers<S: GeeseSystem>(ConstList<'static, EventHandler<S>>);
+pub struct EventHandlers<S: GeeseSystem>(ConstList<'static, EventHandler>, PhantomData<fn(S)>);
 
 impl<S: GeeseSystem> EventHandlers<S> {
     pub const fn new() -> Self {
-        Self(ConstList::new())
+        Self(ConstList::new(), PhantomData)
     }
 
     pub const fn with<Q: MutableRef<S>, T: 'static + Send + Sync>(&'static self, handler: fn(Q, &T)) -> Self {
-        Self(self.0.push(EventHandler::new(handler)))
+        Self(self.0.push(EventHandler::new(handler)), PhantomData)
     }
 }
 
-struct EventHandler<S: GeeseSystem> {
+pub(crate) struct EventHandler {
     event_id: fn() -> TypeId,
-    handler: fn(*mut S, *const ()),
+    handler: fn(*mut (), *const ()),
 }
 
-impl<S: GeeseSystem> EventHandler<S> {
-    pub const fn new<Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
+impl EventHandler {
+    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
         unsafe {
             Self {
                 event_id: TypeId::of::<T>,
@@ -238,10 +243,8 @@ impl<S: GeeseSystem> EventHandler<S> {
         (self.event_id)()
     }
 
-    pub fn handle(&self, system: &mut S, event: *const ()) {
-        unsafe {
-            (transmute::<_, fn(&mut S, *const ())>(self.handler))(system, event)
-        }
+    pub fn handler(&self) -> fn(*mut (), *const ()) {
+        self.handler
     }
 }
 

@@ -209,10 +209,12 @@ impl<'a, T: ?Sized> Drop for SystemRefMut<'a, T> {
 struct ContextHandleInner {
     context_id: u16,
     id: Cell<u16>,
-    dependency_ids: SmallVec<[Cell<u16>; DEFAULT_DEPENDENCY_BUFFER_SIZE]>
+    dependency_ids: SmallVec<[Cell<u16>; Self::DEFAULT_DEPENDENCY_BUFFER_SIZE]>
 }
 
 impl ContextHandleInner {
+    const DEFAULT_DEPENDENCY_BUFFER_SIZE: usize = 4;
+
     fn id(&self) -> u16 {
         self.id.get()
     }
@@ -234,25 +236,23 @@ impl ContextHandleInner {
     }
 }
 
-const DEFAULT_CONTEXT_BUFFER_SIZE: usize = 4;
-const DEFAULT_DEPENDENCY_BUFFER_SIZE: usize = 4;
-const DEFAULT_EVENT_BUFFER_SIZE: usize = 8;
-
 struct ExecutionContext {
     available_systems: *const BitSlice,
     borrow_count: u16,
     context_id: u16,
-    events: UnsafeCell<SmallVec<[Box<dyn Any + Send + Sync>; DEFAULT_EVENT_BUFFER_SIZE]>>,
+    events: UnsafeCell<SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>>,
     mutable_borrows: BitVec,
     systems: *const Vec<MaybeUninit<SystemHolder>>
 }
 
 impl ExecutionContext {
+    const DEFAULT_EVENT_BUFFER_SIZE: usize = 8;
+
     thread_local! {
         static CONTEXTS: UnsafeCell<Vec<*mut ExecutionContext>> = const { UnsafeCell::new(Vec::new()) };
     }
 
-    pub fn execute<T>(context_id: u16, available_systems: &BitSlice, systems: *const Vec<MaybeUninit<SystemHolder>>, f: impl FnOnce() -> T) -> (T, SmallVec<[Box<dyn Any + Send + Sync>; DEFAULT_EVENT_BUFFER_SIZE]>) {
+    pub fn execute<T>(context_id: u16, available_systems: &BitSlice, systems: *const Vec<MaybeUninit<SystemHolder>>, f: impl FnOnce() -> T) -> (T, SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>) {
         unsafe {
             let mut ctx = ExecutionContext {
                 available_systems,
@@ -304,6 +304,7 @@ impl ExecutionContext {
 #[derive(Default)]
 pub struct SystemManager {
     context_id: u16,
+    event_handlers: EventMap,
     transitive_dependencies: SystemFlagsList,
     transitive_dependencies_mut: SystemFlagsList,
     system_descriptors: FxHashMap<TypeId, SystemState>,
@@ -372,6 +373,7 @@ impl SystemManager {
     }
 
     unsafe fn compact_remaining_systems(&mut self, connected: &BitVec) {
+        self.event_handlers.clear();
         let mut new_systems = Vec::with_capacity(self.system_descriptors.len());
         let system_view = new_systems.spare_capacity_mut();
         let mut new_transitive_dependencies = SystemFlagsList::new(false, self.system_descriptors.len());
@@ -384,7 +386,8 @@ impl SystemManager {
             system.set_id(Self::compact_system_id(old_id, connected));
             let new_system = system_view.get_unchecked_mut(system.id() as usize).write(replace(system_holder, MaybeUninit::uninit())).assume_init_ref();
             Self::compact_system_dependencies(new_system, connected);
-            Self::compact_transitive_dependencies(&new_system.handle, connected, self.transitive_dependencies_mut.get_unchecked(old_id as usize), &mut new_transitive_dependencies, &mut new_transitive_dependencies_mut)
+            Self::compact_transitive_dependencies(&new_system.handle, connected, self.transitive_dependencies_mut.get_unchecked(old_id as usize), &mut new_transitive_dependencies, &mut new_transitive_dependencies_mut);
+            self.event_handlers.add_handlers(i as u16, system.descriptor().event_handlers());
         }
 
         new_systems.set_len(self.system_descriptors.len());
@@ -412,6 +415,7 @@ impl SystemManager {
             assert!(self.system_descriptors.len() < u16::MAX as usize, "Maximum number of supported systems exceeded.");
             let mut old_systems = take(&mut self.systems);
 
+            self.event_handlers.clear();
             self.transitive_dependencies = SystemFlagsList::new(false, self.system_descriptors.len());
             self.transitive_dependencies_mut = SystemFlagsList::new(false, self.system_descriptors.len());
     
@@ -428,7 +432,7 @@ impl SystemManager {
                     let handle = system.descriptor().create_handle_data(self.context_id);
                     Self::update_context_data(&*handle, &self.system_descriptors, &system);
                     
-                    let (system, events) = Self::create_system(SystemCreationParams {
+                    let system = Self::create_system(SystemCreationParams {
                         context_id: self.context_id,
                         handle,
                         system: &system,
@@ -439,6 +443,8 @@ impl SystemManager {
 
                     self.systems.push(MaybeUninit::new(system));
                 }
+
+                self.event_handlers.add_handlers(system.id(), system.descriptor().event_handlers());
             }
         }
     }
@@ -483,13 +489,13 @@ impl SystemManager {
         }
     }
 
-    unsafe fn create_system(mut params: SystemCreationParams) -> (SystemHolder, SmallVec<[Box<dyn Any + Send + Sync>; DEFAULT_EVENT_BUFFER_SIZE]>) {
+    unsafe fn create_system(mut params: SystemCreationParams) -> SystemHolder {
         Self::load_transitive_dependencies(&mut params);
 
         let cloned_handle = params.handle.clone();
         let (system, events) = ExecutionContext::execute(params.context_id, params.transitive_dependencies.get_unchecked(params.system.id() as usize), params.systems, move || params.system.descriptor().create(cloned_handle));
 
-        (SystemHolder { handle: params.handle, system_id: params.system.descriptor().system_id(), value: UnsafeCell::new(system) }, events)
+        SystemHolder { handle: params.handle, system_id: params.system.descriptor().system_id(), value: UnsafeCell::new(system) }
     }
 
     unsafe fn load_transitive_dependencies(params: &mut SystemCreationParams) {
@@ -684,6 +690,38 @@ impl<'a> DerefMut for SystemFlagsListEdit<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.editable
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct EventMap {
+    handlers: FxHashMap<TypeId, SmallVec<[EventHandlerEntry; Self::DEFAULT_HANDLER_BUFFER_SIZE]>>
+}
+
+impl EventMap {
+    const DEFAULT_HANDLER_BUFFER_SIZE: usize = 4;
+
+    pub fn add_handlers(&mut self, system_id: u16, handlers: &ConstList<'_, EventHandler>) {
+        for entry in handlers {
+            self.handlers.entry(entry.event_id()).or_default().push(EventHandlerEntry {
+                system_id,
+                handler: entry.handler()
+            });
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.handlers.clear();
+    }
+
+    pub fn handlers(&self, event: TypeId) -> &[EventHandlerEntry] {
+        self.handlers.get(&event).map(|x| &x[..]).unwrap_or_default()
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct EventHandlerEntry {
+    pub system_id: u16,
+    pub handler: fn(*mut (), *const ())
 }
 
 #[cfg(test)]
