@@ -26,6 +26,7 @@ mod traits;
 
 use bitvec::access::*;
 use bitvec::prelude::*;
+use crate::const_list::*;
 use crate::rw_cell::*;
 use crate::static_eval::*;
 pub use crate::traits::*;
@@ -76,8 +77,9 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
         unsafe {
             let index = static_eval!(if let Some(index) = S::DEPENDENCIES.index_of::<T>() { index } else { GeeseContextHandle::<S>::panic_on_invalid_dependency() }, usize, S, T);
             let ctx = (*self.inner.context).borrow();
-            assert!(*ctx.sync_systems.get_unchecked(index) || ctx.owning_thread == current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
-            let guard = ctx.systems.get_unchecked(index).value.borrow().detach();
+            let global_index = self.inner.dependency_id(index as u16) as usize;
+            assert!(*ctx.sync_systems.get_unchecked(global_index) || ctx.owning_thread == current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
+            let guard = ctx.systems.get_unchecked(global_index).value.borrow().detach();
             SystemRef::new(RwCellGuard::map(guard, |system| transmute::<_, &(&T, *const ())>(system).0))
         }
     }
@@ -95,8 +97,9 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
                 }
             }, usize, S, T);
             let ctx = (*self.inner.context).borrow();
-            assert!(*ctx.send_systems.get_unchecked(index) || ctx.owning_thread == current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
-            let guard = ctx.systems.get_unchecked(index).value.borrow_mut().detach();
+            let global_index = self.inner.dependency_id(index as u16) as usize;
+            assert!(*ctx.sync_systems.get_unchecked(global_index) || ctx.owning_thread == current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
+            let guard = ctx.systems.get_unchecked(global_index).value.borrow_mut().detach();
             SystemRefMut::new(RwCellGuardMut::map(guard, |system| transmute::<_, &mut (&mut T, *const ())>(system).0))
         }
     }
@@ -176,6 +179,26 @@ impl ContextHandleInner {
 pub struct GeeseContext(Pin<Box<RwCell<ContextInner>>>);
 
 impl GeeseContext {
+    /// Obtains a reference to the given system.
+    pub fn system<S: GeeseSystem>(&self) -> SystemRef<S> {
+        unsafe {
+            let inner = self.0.borrow();
+            let index = inner.system_initializers.get(&TypeId::of::<S>()).expect("System not found.").id();
+            let guard = inner.systems.get_unchecked(index as usize).value.borrow().detach();
+            SystemRef::new(RwCellGuard::map(guard, |system| transmute::<_, &(&S, *const ())>(system).0))
+        }
+    }
+
+    /// Mutably obtains a reference to the given system.
+    pub fn system_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<S> {
+        unsafe {
+            let inner = self.0.borrow();
+            let index = inner.system_initializers.get(&TypeId::of::<S>()).expect("System not found.").id();
+            let guard = inner.systems.get_unchecked(index as usize).value.borrow_mut().detach();
+            SystemRefMut::new(RwCellGuardMut::map(guard, |system| transmute::<_, &mut (&mut S, *const ())>(system).0))
+        }
+    }
+
     /// Adds a system to the context.
     pub fn add_system<S: GeeseSystem>(&mut self) {
         unsafe {
@@ -195,16 +218,53 @@ impl GeeseContext {
         }
     }
 
+    /// Removes a system from the context, unloading it if it becomes disconnected from the dependency graph.
+    pub fn remove_system<S: GeeseSystem>(&mut self) {
+        unsafe {
+            let mut inner = self.0.borrow_mut();
+            inner.remove_top_level_system::<S>();
+            let connected = inner.determine_connected_systems();
+            if connected.first_zero().is_some() {
+                let mut initializers = take(&mut inner.system_initializers);
+                drop(inner);
+                self.drop_systems(&connected, &mut initializers);
+                let mut inner = self.0.borrow_mut();
+                inner.system_initializers = initializers;
+                inner.compact_remaining_systems(&connected);
+            }
+        }
+    }
+
+    /// Reloads a system and all systems that depend upon it.
+    pub fn reset_system<S: GeeseSystem>(&mut self) {
+        self.0.borrow().reset_system::<S>();
+    }
+
     /// Initializes all systems in the given iterator.
     /// 
     /// # Safety
     /// 
     /// The systems in the iterator must have valid IDs referring to systems in the inner context.
     unsafe fn initialize_systems<'a>(&self, systems: impl Iterator<Item = &'a SystemInitializer>) {
-        let inner: RwCellGuard<'_, ContextInner> = self.0.borrow();
+        let inner = self.0.borrow();
         for system in systems {
             let holder = inner.system_holder(system.id() as usize);
             holder.value.borrow_mut().write(system.descriptor.create(holder.handle.clone()));
+        }
+    }
+
+    /// Drops all systems in the inner context which do not exist in the bitmap.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be sound, all of the zeroed bits in the systems map must correspond
+    /// to valid, initialized systems in the inner context.
+    unsafe fn drop_systems(&self, systems: &BitVec, initializers: &mut FxHashMap<TypeId, SystemInitializer>) {
+        let inner = self.0.borrow();
+        for system in systems.iter_zeros().rev() {
+            let holder = inner.system_holder(system);
+            holder.drop();
+            initializers.remove(&holder.system_id);
         }
     }
 
@@ -231,6 +291,8 @@ impl Drop for GeeseContext {
 /// The backing for a Geese context. The inner context must be pinned
 /// in memory so that pointers to it remain valid.
 struct ContextInner {
+    /// The set of events to which systems respond.
+    event_handlers: EventMap,
     /// The thread on which the context was created.
     owning_thread: ThreadId,
     /// The set of systems that implement the `Send` trait.
@@ -310,7 +372,7 @@ impl ContextInner {
             let mut to_initialize = SmallVec::new();
 
             self.systems.reserve(initializers.len());
-            //self.event_handlers.clear();
+            self.event_handlers.clear();
             self.send_systems = BitVec::repeat(false, initializers.len());
             self.sync_systems = BitVec::repeat(false, initializers.len());
             self.transitive_dependencies = SystemFlagsList::new(false, initializers.len());
@@ -337,13 +399,130 @@ impl ContextInner {
                 self.load_transitive_dependencies(holder.assume_init_mut(), &system);
                 self.systems.push(replace(holder, MaybeUninit::uninit()).assume_init());
 
-                //self.event_handlers.add_handlers(system.id(), system.descriptor().event_handlers());
+                self.event_handlers.add_handlers(system.id(), system.descriptor().event_handlers());
                 self.send_systems.set_unchecked(system.id() as usize, system.descriptor().is_send());
                 self.sync_systems.set_unchecked(system.id() as usize, system.descriptor().is_sync());
             }
 
             to_initialize
         }
+    }
+
+    /// Removes a system from being top-level in the dependency graph.
+    fn remove_top_level_system<S: GeeseSystem>(&mut self) {
+        let system = self.system_initializers.get(&TypeId::of::<S>()).expect("System was not loaded.");
+        assert!(system.top_level(), "System {:?} was not previously added.", type_name::<S>());
+        system.set_top_level(false);
+    }
+
+    /// Computes the set of systems that are reachable from the top levels of the dependency graph.
+    fn determine_connected_systems(&self) -> BitVec {
+        unsafe {
+            let mut connected_systems = BitVec::repeat(false, self.systems.len());
+    
+            for system in self.system_initializers.values() {
+                if system.top_level() {
+                    connected_systems.set_unchecked(system.id() as usize, true);
+                    connected_systems[..] |= self.transitive_dependencies.get_unchecked(system.id() as usize);
+                }
+            }
+
+            connected_systems
+        }
+    }
+
+    /// Loads all transitive dependencies of the given system into the transitive dependency lists. All dependencies
+    /// of this system must have had their transitive dependencies loaded prior to calling this method.
+    /// 
+    /// # Safety
+    /// 
+    /// The system holder and initializer IDs must all refer to valid systems within the context.
+    unsafe fn load_transitive_dependencies(&mut self, holder: &SystemHolder, initializer: &SystemInitializer) {
+        let mut edit = self.transitive_dependencies.edit_unchecked(holder.handle.id() as usize);
+        let mut edit_mut = self.transitive_dependencies_mut.edit_unchecked(holder.handle.id() as usize);
+
+        for i in 0..holder.handle.dependency_len() {
+            let global_index = holder.handle.dependency_id(i);
+            edit.set(global_index as usize, true);
+            edit_mut.set(global_index as usize, initializer.descriptor().dependencies().as_inner().get(i as usize).unwrap_unchecked().mutable());
+    
+            edit.or_with_unchecked(global_index as usize);
+            edit_mut.or_with_unchecked(global_index as usize);
+        }
+    }
+    
+    /// Compacts the set of remaining systems into a new systems array after some systems have been removed.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be sound, the connected bitmap must correspond exactly to which systems
+    /// are initialized in the context.
+    pub unsafe fn compact_remaining_systems(&mut self, connected: &BitVec) {
+        self.event_handlers.clear();
+        self.systems.set_len(0);
+        let old_systems = self.systems.spare_capacity_mut();
+
+        let mut new_systems = Vec::with_capacity(self.system_initializers.len());
+        let system_view = new_systems.spare_capacity_mut();
+
+        self.send_systems = BitVec::repeat(false, self.system_initializers.len());
+        self.sync_systems = BitVec::repeat(false, self.system_initializers.len());
+        let mut new_transitive_dependencies = SystemFlagsList::new(false, self.system_initializers.len());
+        let mut new_transitive_dependencies_mut = SystemFlagsList::new(false, self.system_initializers.len());
+
+        for initializer in self.system_initializers.values() {
+            let old_id = initializer.id();
+            initializer.set_id(Self::compact_system_id(old_id, connected));
+            let system_holder = old_systems.get_unchecked_mut(old_id as usize);
+            let new_system = system_view.get_unchecked_mut(initializer.id() as usize).write(replace(system_holder, MaybeUninit::uninit()).assume_init());
+            new_system.handle.set_id(initializer.id());
+            Self::compact_transitive_dependencies(new_system, connected, self.transitive_dependencies_mut.get_unchecked(old_id as usize), &mut new_transitive_dependencies, &mut new_transitive_dependencies_mut);
+            self.event_handlers.add_handlers(initializer.id(), initializer.descriptor().event_handlers());
+            self.send_systems.set_unchecked(initializer.id() as usize, initializer.descriptor().is_send());
+            self.sync_systems.set_unchecked(initializer.id() as usize, initializer.descriptor().is_sync());
+        }
+
+        Self::drop_dead_holders(connected, old_systems);
+
+        new_systems.set_len(self.system_initializers.len());
+        self.systems = new_systems;
+        self.transitive_dependencies = new_transitive_dependencies;
+        self.transitive_dependencies_mut = new_transitive_dependencies_mut;
+    }
+
+    /// Reloads all of the system instances that depend upon the given system.
+    pub fn reset_system<S: GeeseSystem>(&self) {
+        unsafe {
+            let id = self.system_initializers.get(&TypeId::of::<S>()).expect("Attempted to reset nonexistant system.").id();
+            let to_load = self.unload_dependents(id);
+            self.load_dependents(to_load);
+        }
+    }
+
+    /// Loads all systems that depend upon the system with the given ID in topological order.
+    unsafe fn load_dependents(&self, to_load: SmallVec<[u16; Self::DEFAULT_SYSTEM_PROCESSING_SIZE]>) {
+        for i in to_load.into_iter().rev() {
+            let holder = self.systems.get_unchecked(i as usize);
+            let descriptor = self.system_initializers.get(&holder.system_id).unwrap_unchecked().descriptor();
+            holder.value.borrow_mut().write(descriptor.create(holder.handle.clone()));
+        }
+    }
+
+    /// Unloads all systems that depend upon the system with the given ID in reverse topological order.
+    unsafe fn unload_dependents(&self, id: u16) -> SmallVec<[u16; Self::DEFAULT_SYSTEM_PROCESSING_SIZE]> {
+        let mut dropped = SmallVec::new();
+
+        for i in ((id as usize + 1)..self.systems.len()).rev() {
+            if *self.transitive_dependencies.get_unchecked(i).get_unchecked(id as usize) {
+                self.systems.get_unchecked(i).drop();
+                dropped.push(i as u16);
+            }
+        }
+
+        self.systems.get_unchecked(id as usize).drop();
+        dropped.push(id);
+
+        dropped
     }
 
     /// Topologically sorts all systems in the map, producing a vector sorted such that all dependencies come before
@@ -374,24 +553,47 @@ impl ContextInner {
             data.handle.set_dependency_id(index as u16, descriptors.get(&dependency.dependency_id().into()).unwrap_unchecked().id());
         }
     }
-
-    /// Loads all transitive dependencies of the given system into the transitive dependency lists. All dependencies
-    /// of this system must have had their transitive dependencies loaded prior to calling this method.
+    
+    /// Computes the new system ID from the set of remaining systems in the bitmap.
     /// 
     /// # Safety
     /// 
-    /// The system holder and initializer IDs must all refer to valid systems within the context.
-    unsafe fn load_transitive_dependencies(&mut self, holder: &SystemHolder, initializer: &SystemInitializer) {
-        let mut edit = self.transitive_dependencies.edit_unchecked(holder.handle.id() as usize);
-        let mut edit_mut = self.transitive_dependencies_mut.edit_unchecked(holder.handle.id() as usize);
+    /// For this function to be sound, the system ID must be less than the bitmap length.
+    unsafe fn compact_system_id(system: u16, remaining_systems: &BitVec) -> u16 {
+        (*bitvec::ptr::bitslice_from_raw_parts(remaining_systems.as_bitptr(), system as usize)).count_ones() as u16
+    }
+
+    /// Updates the system handle's dependency maps using the connectivity bitmap after some systems have been dropped.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be defined, all of the holder's current dependency values
+    /// must be less than the connected bitmap and transitive dependency list lengths.
+    unsafe fn compact_transitive_dependencies(holder: &SystemHolder, connected: &BitVec, old_transitive_dependencies_mut: &BitSlice, transitive_dependencies: &mut SystemFlagsList, transitive_dependencies_mut: &mut SystemFlagsList) {
+        let mut edit = transitive_dependencies.edit_unchecked(holder.handle.id() as usize);
+        let mut edit_mut = transitive_dependencies_mut.edit_unchecked(holder.handle.id() as usize);
 
         for i in 0..holder.handle.dependency_len() {
-            let global_index = holder.handle.dependency_id(i);
+            let old_global_index = holder.handle.dependency_id(i);
+            let global_index = Self::compact_system_id(old_global_index, connected);
             edit.set(global_index as usize, true);
-            edit_mut.set(global_index as usize, initializer.descriptor().dependencies().as_inner().get(i as usize).unwrap_unchecked().mutable());
-    
+            edit_mut.set(global_index as usize, *old_transitive_dependencies_mut.get_unchecked(old_global_index as usize));
+
             edit.or_with_unchecked(global_index as usize);
             edit_mut.or_with_unchecked(global_index as usize);
+            holder.handle.set_dependency_id(i, global_index);
+        }
+    }
+
+    /// Drops all dead system holders from the systems array.
+    /// 
+    /// # Safety
+    /// 
+    /// For this call to be defined, all of the zeroes in the connected bitmap must correspond to
+    /// valid, initialized system holders in the old systems list.
+    unsafe fn drop_dead_holders(connected: &BitVec, old_systems: &mut [MaybeUninit<SystemHolder>]) {
+        for dead_system in connected.iter_zeros() {
+            old_systems.get_unchecked_mut(dead_system).assume_init_drop();
         }
     }
 }
@@ -399,6 +601,7 @@ impl ContextInner {
 impl Default for ContextInner {
     fn default() -> Self {
         Self {
+            event_handlers: EventMap::default(),
             owning_thread: current().id(),
             send_systems: BitVec::default(),
             sync_systems: BitVec::default(),
@@ -680,6 +883,48 @@ impl<'a, T: ?Sized> DerefMut for SystemRefMut<'a, T> {
     }
 }
 
+/// Stores a mapping from event type IDs to groups of event handlers.
+#[derive(Clone, Debug, Default)]
+struct EventMap {
+    /// The inner mapping from type IDs to event handlers.
+    handlers: FxHashMap<TypeId, SmallVec<[EventHandlerEntry; Self::DEFAULT_HANDLER_BUFFER_SIZE]>>
+}
+
+impl EventMap {
+    /// The default amount of space to allocate for event handler lists.
+    const DEFAULT_HANDLER_BUFFER_SIZE: usize = 4;
+
+    /// Adds all of the event handlers in the given list to this map, associating them with
+    /// the provided system ID.
+    pub fn add_handlers(&mut self, system_id: u16, handlers: &ConstList<'_, EventHandler>) {
+        for entry in handlers {
+            self.handlers.entry(entry.event_id()).or_default().push(EventHandlerEntry {
+                system_id,
+                handler: *entry.handler()
+            });
+        }
+    }
+
+    /// Clears the event map of all handlers.
+    pub fn clear(&mut self) {
+        self.handlers.clear();
+    }
+
+    /// Gets the event handlers that respond to the provided event type.
+    pub fn handlers(&self, event: TypeId) -> &[EventHandlerEntry] {
+        self.handlers.get(&event).map(|x| &x[..]).unwrap_or_default()
+    }
+}
+
+/// Describes a single event handler.
+#[derive(Copy, Clone, Debug)]
+struct EventHandlerEntry {
+    /// The invoker that may be used to dispatch events.
+    pub handler: EventInvoker,
+    /// The ID of the system with which this event handler is associated.
+    pub system_id: u16,
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -794,5 +1039,7 @@ mod tests
         println!("in between");
         mgr.add_system::<A>();
         println!("death");
+        mgr.reset_system::<D>();
+        mgr.remove_system::<A>();
     }
 }

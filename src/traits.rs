@@ -139,68 +139,13 @@ impl DependencyHolder {
     }
 }
 
-/// Describes a system's properties and allows it to be instantiated.
-pub(super) trait SystemDescriptor: 'static + Send + Sync {
-    /// Creates a new system instance for the provided handle.
-    fn create(&self, handle: Arc<ContextHandleInner>) -> Box<dyn Any>;
-
-    /// The set of dependencies that this system has.
-    fn dependencies(&self) -> &'static Dependencies;
-
-    /// The number of dependencies that this system has.
-    fn dependency_len(&self) -> usize;
-
-    /// Whether this type may be safely sent across threads.
-    fn is_send(&self) -> bool;
-
-    /// Whether references to this type may be safely shared across threads.
-    fn is_sync(&self) -> bool;
-
-    /// Gets the type ID associated with the given system.
-    fn system_id(&self) -> TypeId;
-}
-
-/// Describes a certain system type's properties and allows it to be instantiated.
-pub(crate) struct TypedSystemDescriptor<S: GeeseSystem>(PhantomData<fn(S)>);
-
-impl<S: GeeseSystem> Default for TypedSystemDescriptor<S> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
-    fn create(&self, handle: Arc<ContextHandleInner>) -> Box<dyn Any> {
-        Box::new(S::new(GeeseContextHandle::new(handle)))
-    }
-
-    fn dependencies(&self) -> &'static Dependencies {
-        &S::DEPENDENCIES
-    }
-
-    fn dependency_len(&self) -> usize {
-        const_eval!(S::DEPENDENCIES.as_inner().len(), usize, S)
-    }
-
-    fn is_send(&self) -> bool {
-        implements!(S, Send)
-    }
-
-    fn is_sync(&self) -> bool {
-        implements!(S, Sync)
-    }
-
-    fn system_id(&self) -> TypeId {
-        TypeId::of::<S>()
-    }
-}
-
 /// Denotes a list of system methods that respond to events.
+#[allow(unused_variables)]
 pub struct EventHandlers<S: GeeseSystem> {
     /// The inner list of event handlers.
     inner: ConstList<'static, EventHandler>,
     /// Phantom data to mark the system as used.
-    _data: PhantomData<fn(S)>
+    data: PhantomData<fn(S)>
 }
 
 impl<S: GeeseSystem> EventHandlers<S> {
@@ -208,7 +153,7 @@ impl<S: GeeseSystem> EventHandlers<S> {
     pub const fn new() -> Self {
         Self {
             inner: ConstList::new(),
-            _data: PhantomData
+            data: PhantomData
         }
     }
 
@@ -216,8 +161,13 @@ impl<S: GeeseSystem> EventHandlers<S> {
     pub const fn with<Q: MutableRef<S>, T: 'static + Send + Sync>(&'static self, handler: fn(Q, &T)) -> Self {
         Self {
             inner: self.inner.push(EventHandler::new(handler)),
-            _data: PhantomData
+            data: PhantomData
         }
+    }
+
+    /// Gets a reference to the inner list of event handlers.
+    fn as_inner(&self) -> &ConstList<'_, EventHandler> {
+        &self.inner
     }
 }
 
@@ -291,6 +241,69 @@ impl EventInvoker {
     /// as arguments. These must both refer to valid objects of the correct system and event type.
     unsafe fn pointer_flattener<T: 'static + Send + Sync>(system: *mut (), value: &dyn Any, to_run: *const ()) {
         transmute::<_, fn(*mut (), &T)>(to_run)(system, value.downcast_ref().unwrap_unchecked())
+    }
+}
+
+/// Describes a system's properties and allows it to be instantiated.
+pub(super) trait SystemDescriptor: 'static + Send + Sync {
+    /// Creates a new system instance for the provided handle.
+    fn create(&self, handle: Arc<ContextHandleInner>) -> Box<dyn Any>;
+
+    /// The set of dependencies that this system has.
+    fn dependencies(&self) -> &'static Dependencies;
+
+    /// The number of dependencies that this system has.
+    fn dependency_len(&self) -> usize;
+
+    /// The event handlers associated with this system.
+    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler>;
+
+    /// Whether this type may be safely sent across threads.
+    fn is_send(&self) -> bool;
+
+    /// Whether references to this type may be safely shared across threads.
+    fn is_sync(&self) -> bool;
+
+    /// Gets the type ID associated with the given system.
+    fn system_id(&self) -> TypeId;
+}
+
+/// Describes a certain system type's properties and allows it to be instantiated.
+pub(crate) struct TypedSystemDescriptor<S: GeeseSystem>(PhantomData<fn(S)>);
+
+impl<S: GeeseSystem> Default for TypedSystemDescriptor<S> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
+    fn create(&self, handle: Arc<ContextHandleInner>) -> Box<dyn Any> {
+        Box::new(S::new(GeeseContextHandle::new(handle)))
+    }
+
+    fn dependencies(&self) -> &'static Dependencies {
+        &S::DEPENDENCIES
+    }
+
+    fn dependency_len(&self) -> usize {
+        const_eval!(S::DEPENDENCIES.as_inner().len(), usize, S)
+    }
+
+    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler> {
+        S::EVENT_HANDLERS.as_inner()
+    }
+
+    fn is_send(&self) -> bool {
+        implements!(S, Send)
+    }
+
+    fn is_sync(&self) -> bool {
+        implements!(S, Sync)
+    }
+
+    fn system_id(&self) -> TypeId {
+        TypeId::of::<S>()
     }
 }
 
