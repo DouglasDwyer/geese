@@ -1,152 +1,114 @@
 use crate::*;
 use crate::const_list::*;
+use crate::const_type_id::*;
+use std::any::*;
+use std::mem::*;
 use private::*;
 
+/// Dynamically determines whether a given type implements the provided trait.
+macro_rules! implements {
+    ($name: ident, $trait: ident) => {
+        {
+            use std::cell::*;
+
+            struct TraitTest<'a, T: ?Sized> {
+                is_trait: &'a Cell<bool>,
+                data: PhantomData<T>,
+            }
+    
+            impl<T: ?Sized> Clone for TraitTest<'_, T> {
+                #[inline(always)]
+                fn clone(&self) -> Self {
+                    self.is_trait.set(false);
+                    TraitTest {
+                        is_trait: self.is_trait,
+                        data: PhantomData,
+                    }
+                }
+            }
+
+            impl<T: ?Sized + $trait> Copy for TraitTest<'_, T> {}
+    
+            let is_trait = Cell::new(true);
+    
+            _ = [TraitTest::<$name> {
+                is_trait: &is_trait,
+                data: PhantomData,
+            }]
+            .clone();
+    
+            is_trait.get()
+        }
+    };
+}
+
+/// Represents a collection of event handlers with internal state.
 pub trait GeeseSystem: 'static + Sized {
+    /// The set of dependencies that this system has.
     const DEPENDENCIES: Dependencies;
+    
+    /// The set of events to which this system responds.
     const EVENT_HANDLERS: EventHandlers<Self>;
 
+    /// Creates a new instance of the system for the given system handle.
     fn new(ctx: GeeseContextHandle<Self>) -> Self;
 }
 
-pub(super) struct SystemValidator {
-    dependencies: &'static Dependencies
+/// Denotes a list of system dependencies.
+#[derive(Copy, Clone, Debug)]
+pub struct Dependencies {
+    /// The inner list of dependencies.
+    inner: ConstList<'static, DependencyHolder>
 }
-
-impl SystemValidator {
-    pub const fn validate<S: GeeseSystem>() {
-        Self { dependencies: &S::DEPENDENCIES }.validate_list();
-    }
-
-    const fn validate_list(&self) {
-        let mut i = 0;
-        while i < self.dependencies.len() {
-            Self { dependencies: self.dependencies.get(i).dependencies }.validate_list();
-            i += 1;
-        }
-
-        assert!(!self.has_duplicate_dependencies(), "System had one or more duplicate dependencies.");
-        //assert!(!self.has_conflicting_mutable_paths(), "System dependencies had conflicting borrows: cannot borrow system as mutable more than once in the dependency graph.");
-    }
-
-    const fn has_conflicting_mutable_paths(&self) -> bool {
-        Self::conflicting_dependency_paths(&ConstList::new().push(self.dependencies.0), &ConstList::new())
-    }
-
-    const fn conflicting_dependency_paths<'a>(dependencies: &'a ConstList<'a, ConstList<'a, DependencyHolder>>, already_seen: &'a ConstList<'a, DependencyHolder>) -> bool {
-        let (begin, rest) = dependencies.pop();
-        if let Some(list) = begin {
-            let (dependency, other_dependencies) = list.pop();
-            
-            if let Some(first) = dependency {
-                if Self::has_conflicting_dependency(first, already_seen) {
-                    true
-                }
-                else {
-                    Self::conflicting_dependency_paths(&rest.push(*other_dependencies).push(first.dependencies.0), &already_seen.push(*first))
-                }
-            }
-            else {
-                Self::conflicting_dependency_paths(rest, already_seen)
-            }
-        }
-        else {
-            false
-        }
-    }
-
-    const fn has_duplicate_dependencies(&self) -> bool {
-        let mut i = 0;
-    
-        while i < self.dependencies.len() {
-            let mut j = i + 1;
-    
-            while j < self.dependencies.len() {
-                if self.dependencies.get(i).dependency_id().eq(&self.dependencies.get(j).dependency_id()) {
-                    return true;
-                }
-    
-                j += 1;
-            }
-    
-            i += 1;
-        }
-    
-        false
-    }
-
-    const fn has_conflicting_dependency(holder: &DependencyHolder, list: &ConstList<'_, DependencyHolder>) -> bool {
-        let mut i = 0;
-
-        while i < list.len() {
-            if let Some(other) = list.get(i) {
-                if holder.dependency_id().eq(&other.dependency_id()) && (holder.mutable || other.mutable) {
-                    return true;
-                }
-            }
-            else {
-                panic!("Index was out-of-bounds.");
-            }
-
-            i += 1;
-        }
-
-        false
-    }
-}
-
-pub struct Dependencies(pub(super) ConstList<'static, DependencyHolder>);
 
 impl Dependencies {
+    /// Creates a new, empty list of dependencies.
     pub const fn new() -> Self {
-        Self(ConstList::new())
+        Self {
+            inner: ConstList::new()
+        }
     }
 
+    /// Adds the given type to the dependency list, returning the modified list.
     pub const fn with<S: Dependency>(&'static self) -> Self {
-        Self(self.0.push(DependencyHolder::new::<S>()))
-    }
-
-    pub(super) const fn get(&self, index: usize) -> &DependencyHolder {
-        if let Some(value) = self.0.get(index) {
-            value
-        }
-        else {
-            panic!("Index out-of-range.");
+        Self {
+            inner: self.inner.push(DependencyHolder::new::<S>())
         }
     }
 
-    pub(super) const fn index_of(&self, id: ConstTypeId) -> Option<usize> {
+    /// Gets a reference to the inner list of dependency holders.
+    pub(crate) const fn as_inner(&self) -> &ConstList<'static, DependencyHolder> {
+        &self.inner
+    }
+
+    /// Determines the local index in this dependency list of the provided system.
+    pub(crate) const fn index_of<S: GeeseSystem>(&self) -> Option<usize> {
         let mut i = 0;
-        while i < self.0.len() {
-            if let Some(value) = self.0.get(i) {
-                if value.dependency_id().eq(&id) {
-                    return Some(i);
-                }
+        while i < self.inner.len() {
+            if const_unwrap(self.inner.get(i)).dependency_id().eq(&ConstTypeId::of::<S>()) {
+                return Some(i);
             }
-            else {
-                panic!("Index was out-of-range.");
-            }
-
             i += 1;
         }
-
         None
-    }
-
-    pub(super) const fn len(&self) -> usize {
-        self.0.len()
     }
 }
 
-#[derive(Copy, Clone)]
+/// Describes a system dependency.
+#[derive(Copy, Clone, Debug)]
 pub(crate) struct DependencyHolder {
+    /// A function which retrieves a descriptor at runtime.
     descriptor_getter: fn() -> Box<dyn SystemDescriptor>,
+    /// The list of this dependency's subdependencies.
     dependencies: &'static Dependencies,
+    /// Whether this dependency may be mutably borrowed.
     mutable: bool,
+    /// The type ID of the system.
     type_id: ConstTypeId,
 }
 
 impl DependencyHolder {
+    /// Creates a holder for the provided dependency.
     pub const fn new<S: Dependency>() -> Self {
         Self {
             descriptor_getter: Self::get_descriptor::<S::System>,
@@ -156,32 +118,50 @@ impl DependencyHolder {
         }
     }
 
+    /// Gets the type ID of this dependency.
     pub const fn dependency_id(&self) -> ConstTypeId {
         self.type_id
     }
 
+    /// Determines whether this dependency may be mutably borrowed.
     pub const fn mutable(&self) -> bool {
         self.mutable
     }
 
+    /// Gets a descriptor for use with system instantiation.
     pub fn descriptor(&self) -> Box<dyn SystemDescriptor> {
         (self.descriptor_getter)()
     }
 
+    /// Creates a descriptor for instantiation with the given system.
     fn get_descriptor<S: GeeseSystem>() -> Box<dyn SystemDescriptor> {
-        Box::new(TypedSystemDescriptor::<S>::default())
+        Box::<TypedSystemDescriptor<S>>::default()
     }
 }
 
+/// Describes a system's properties and allows it to be instantiated.
 pub(super) trait SystemDescriptor: 'static + Send + Sync {
-    fn create(&self, inner: Arc<ContextHandleInner>) -> Box<dyn Any>;
-    fn create_handle_data(&self, context_id: u16) -> Arc<ContextHandleInner>;
+    /// Creates a new system instance for the provided handle.
+    fn create(&self, handle: Arc<ContextHandleInner>) -> Box<dyn Any>;
+
+    /// The set of dependencies that this system has.
     fn dependencies(&self) -> &'static Dependencies;
-    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler>;
+
+    /// The number of dependencies that this system has.
+    fn dependency_len(&self) -> usize;
+
+    /// Whether this type may be safely sent across threads.
+    fn is_send(&self) -> bool;
+
+    /// Whether references to this type may be safely shared across threads.
+    fn is_sync(&self) -> bool;
+
+    /// Gets the type ID associated with the given system.
     fn system_id(&self) -> TypeId;
 }
 
-pub struct TypedSystemDescriptor<S: GeeseSystem>(PhantomData<fn(S)>);
+/// Describes a certain system type's properties and allows it to be instantiated.
+pub(crate) struct TypedSystemDescriptor<S: GeeseSystem>(PhantomData<fn(S)>);
 
 impl<S: GeeseSystem> Default for TypedSystemDescriptor<S> {
     fn default() -> Self {
@@ -190,21 +170,24 @@ impl<S: GeeseSystem> Default for TypedSystemDescriptor<S> {
 }
 
 impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
-    fn create(&self, inner: Arc<ContextHandleInner>) -> Box<dyn Any> {
-        Box::new(S::new(GeeseContextHandle::new(inner)))
-    }
-
-    fn create_handle_data(&self, context_id: u16) -> Arc<ContextHandleInner> {
-        let dependencies = static_eval!(S::DEPENDENCIES.len(), usize, S);
-        Arc::new(ContextHandleInner { context_id, id: Cell::new(context_id), dependency_ids: smallvec!(Cell::default(); dependencies) })
+    fn create(&self, handle: Arc<ContextHandleInner>) -> Box<dyn Any> {
+        Box::new(S::new(GeeseContextHandle::new(handle)))
     }
 
     fn dependencies(&self) -> &'static Dependencies {
         &S::DEPENDENCIES
     }
 
-    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler> {
-        &S::EVENT_HANDLERS.0
+    fn dependency_len(&self) -> usize {
+        const_eval!(S::DEPENDENCIES.as_inner().len(), usize, S)
+    }
+
+    fn is_send(&self) -> bool {
+        implements!(S, Send)
+    }
+
+    fn is_sync(&self) -> bool {
+        implements!(S, Sync)
     }
 
     fn system_id(&self) -> TypeId {
@@ -212,64 +195,166 @@ impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
     }
 }
 
-pub struct EventHandlers<S: GeeseSystem>(ConstList<'static, EventHandler>, PhantomData<fn(S)>);
+/// Denotes a list of system methods that respond to events.
+pub struct EventHandlers<S: GeeseSystem> {
+    /// The inner list of event handlers.
+    inner: ConstList<'static, EventHandler>,
+    /// Phantom data to mark the system as used.
+    _data: PhantomData<fn(S)>
+}
 
 impl<S: GeeseSystem> EventHandlers<S> {
+    /// Creates a new, empty list of event handlers.
     pub const fn new() -> Self {
-        Self(ConstList::new(), PhantomData)
-    }
-
-    pub const fn with<Q: MutableRef<S>, T: 'static + Send + Sync>(&'static self, handler: fn(Q, &T)) -> Self {
-        Self(self.0.push(EventHandler::new(handler)), PhantomData)
-    }
-}
-
-pub(crate) struct EventHandler {
-    event_id: fn() -> TypeId,
-    handler: fn(*mut (), *const ()),
-}
-
-impl EventHandler {
-    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
-        unsafe {
-            Self {
-                event_id: TypeId::of::<T>,
-                handler: transmute(handler)
-            }
+        Self {
+            inner: ConstList::new(),
+            _data: PhantomData
         }
     }
 
+    /// Adds the given event handler to the list, returning the modified list.
+    pub const fn with<Q: MutableRef<S>, T: 'static + Send + Sync>(&'static self, handler: fn(Q, &T)) -> Self {
+        Self {
+            inner: self.inner.push(EventHandler::new(handler)),
+            _data: PhantomData
+        }
+    }
+}
+
+/// Describes an event handler for a system.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct EventHandler {
+    /// A function that retrieves the type ID of the event.
+    event_id: fn() -> TypeId,
+    /// A reference to the event handler function.
+    handler: EventInvoker,
+}
+
+impl EventHandler {
+    /// Creates a new event handler to wrap the given function pointer.
+    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
+        Self {
+            event_id: TypeId::of::<T>,
+            handler: EventInvoker::new(handler)
+        }
+    }
+
+    /// Gets the type ID of the event to which this handler responds.
     pub fn event_id(&self) -> TypeId {
         (self.event_id)()
     }
 
-    pub fn handler(&self) -> fn(*mut (), *const ()) {
-        self.handler
+    /// Obtains a reference to the event handler function.
+    pub fn handler(&self) -> &EventInvoker {
+        &self.handler
     }
 }
 
+/// Provides the ability to invoke an event handler method.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct EventInvoker {
+    /// A function that casts the event and handler function to a concrete type,
+    /// and then invokes the handler.
+    pointer_flattener: unsafe fn(*mut (), &dyn Any, *const ()),
+    /// The handler associated with this event invoker.
+    handler: *const ()
+}
+
+impl EventInvoker {
+    /// Creates a new event invoker to wrap the given function pointer.
+    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
+        unsafe {
+            Self {
+                pointer_flattener: Self::pointer_flattener::<T>,
+                handler: handler as *const ()
+            }
+        }
+    }
+
+    /// Invokes the event using the given system pointer and event value.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function to be sound, the system pointer must reference a valid
+    /// instance of the system type associated with this event handler. No other references
+    /// to the system must exist. Further, the provided value must be of the event type
+    /// associated with this event handler.
+    pub unsafe fn invoke(&self, system: *mut (), value: &dyn Any) {
+        (self.pointer_flattener)(system, value, self.handler);
+    }
+
+    /// Invokes the provided pointer as a function handle with the given system and value as arguments.
+    /// 
+    /// # Safety
+    /// 
+    /// The pointer to run must be a valid event handler function that accepts the system and value
+    /// as arguments. These must both refer to valid objects of the correct system and event type.
+    unsafe fn pointer_flattener<T: 'static + Send + Sync>(system: *mut (), value: &dyn Any, to_run: *const ()) {
+        transmute::<_, fn(*mut (), &T)>(to_run)(system, value.downcast_ref().unwrap_unchecked())
+    }
+}
+
+/// Marks that a dependency may be mutably borrowed.
 pub struct Mut<S: GeeseSystem>(PhantomData<fn(S)>);
 
-impl<S: GeeseSystem> Dependency for Mut<S> {
-    type System = S;
+/// Determines whether the given list of dependencies, or any subdependency lists,
+/// have unnecessary duplicates.
+pub(crate) const fn has_duplicate_dependencies(dependencies: &Dependencies) -> bool {
+    let inner_deps = dependencies.as_inner();
 
-    const MUTABLE: bool = true;
+    let mut i = 0;
+
+    while i < inner_deps.len() {
+        if has_duplicate_dependencies(const_unwrap(inner_deps.get(i)).dependencies) {
+            return true;
+        }
+
+        let mut j = i + 1;
+
+        while j < inner_deps.len() {
+            if const_unwrap(inner_deps.get(i)).dependency_id().eq(&const_unwrap(inner_deps.get(j)).dependency_id()) {
+                return true;
+            }
+
+            j += 1;
+        }
+
+        i += 1;
+    }
+
+    false
 }
 
-impl<S: GeeseSystem> Dependency for S {
-    type System = S;
-
-    const MUTABLE: bool = false;
-}
-
+/// Hides traits from being externally visible.
 mod private {
     use super::*;
 
+    /// Describes one system's dependency on another.
     pub trait Dependency {
+        /// The underlying type of the dependency.
         type System: GeeseSystem;
+
+        /// Whether the dependency may be mutably borrowed.
         const MUTABLE: bool;
     }
 
+    impl<S: GeeseSystem> Dependency for S {
+        type System = S;
+
+        const MUTABLE: bool = false;
+    }
+
+    impl<S: GeeseSystem> Dependency for Mut<S> {
+        type System = S;
+
+        const MUTABLE: bool = true;
+    }
+
+    /// Trait that marks a type as a mutable reference. This is used to
+    /// hide mutable references from `const` functions, so that they may
+    /// be manipulated in a `const` context.
     pub trait MutableRef<T> {}
+
     impl<'a, T> MutableRef<T> for &'a mut T {}
+
 }

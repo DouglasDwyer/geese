@@ -15,6 +15,5 @@ fxhash = "0.2.1"
 smallvec = "1.11.0"
 topological-sort = "0.2.2"
 
-[features]
-default = [ "static_check" ]
-static_check = []
+[build-dependencies]
+rustversion = "1.0.14"

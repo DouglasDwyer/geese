@@ -1,12 +1,11 @@
-/// Evaluates the provided expression in a static context if the `static_check` feature is enabled.
-/// Otherwise, evaluates the expression at runtime.
+/// Evaluates the provided expression in a static context on nightly, and during runtime on stable.
 #[macro_export]
 macro_rules! static_eval {
     ($assertion: expr, $result_type: ty, $($type_parameter: ident $(,)?)*) => {
         {
             struct StaticEval<$($type_parameter: GeeseSystem, )*>(PhantomData<fn($($type_parameter, )*)>);
             
-            #[cfg(feature = "static_check")]
+            #[cfg(unstable)]
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 const VALUE: $result_type = $assertion;
                 
@@ -16,7 +15,7 @@ macro_rules! static_eval {
                 }
             }
     
-            #[cfg(not(feature = "static_check"))]
+            #[cfg(not(unstable))]
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 #[inline(never)]
                 const fn calculate() -> $result_type {
@@ -27,4 +26,35 @@ macro_rules! static_eval {
             StaticEval::<$($type_parameter, )*>::calculate()
         }
     };
+}
+
+/// Evaluates the provided expression in a static context.
+#[macro_export]
+macro_rules! const_eval {
+    ($assertion: expr, $result_type: ty, $($type_parameter: ident $(,)?)*) => {
+        {
+            struct StaticEval<$($type_parameter: GeeseSystem, )*>(PhantomData<fn($($type_parameter, )*)>);
+            
+            impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
+                const VALUE: $result_type = $assertion;
+                
+                #[inline(never)]
+                const fn calculate() -> $result_type {
+                    Self::VALUE
+                }
+            }
+    
+            StaticEval::<$($type_parameter, )*>::calculate()
+        }
+    };
+}
+
+/// Attempts to unwrap an option in a `const` context. If the option has no value, panics.
+pub const fn const_unwrap<T: Copy>(value: Option<T>) -> T {
+    if let Some(result) = value {
+        result
+    }
+    else {
+        panic!("Constant unwrap failed.")
+    }
 }
