@@ -45,10 +45,10 @@ macro_rules! implements {
 /// Represents a collection of event handlers with internal state.
 pub trait GeeseSystem: 'static + Sized {
     /// The set of dependencies that this system has.
-    const DEPENDENCIES: Dependencies;
+    const DEPENDENCIES: Dependencies = Dependencies::new();
     
     /// The set of events to which this system responds.
-    const EVENT_HANDLERS: EventHandlers<Self>;
+    const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new();
 
     /// Creates a new instance of the system for the given system handle.
     fn new(ctx: GeeseContextHandle<Self>) -> Self;

@@ -14,6 +14,8 @@ bitvec = "1.0.1"
 fxhash = "0.2.1"
 smallvec = "1.11.0"
 topological-sort = "0.2.2"
+vecdeque-stableix = "1.1.1"
+wasm_sync = "0.1.0"
 
 [build-dependencies]
 rustversion = "1.0.14"
