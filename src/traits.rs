@@ -205,7 +205,7 @@ impl EventHandler {
 pub(crate) struct EventInvoker {
     /// A function that casts the event and handler function to a concrete type,
     /// and then invokes the handler.
-    pointer_flattener: unsafe fn(*mut (), &dyn Any, *const ()),
+    pointer_flattener: Option<unsafe fn(*mut (), &dyn Any, *const ())>,
     /// The handler associated with this event invoker.
     handler: *const ()
 }
@@ -215,7 +215,7 @@ impl EventInvoker {
     pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
         unsafe {
             Self {
-                pointer_flattener: Self::pointer_flattener::<T>,
+                pointer_flattener: Some(Self::pointer_flattener::<T>),
                 handler: handler as *const ()
             }
         }
@@ -230,7 +230,7 @@ impl EventInvoker {
     /// to the system must exist. Further, the provided value must be of the event type
     /// associated with this event handler.
     pub unsafe fn invoke(&self, system: *mut (), value: &dyn Any) {
-        (self.pointer_flattener)(system, value, self.handler);
+        (self.pointer_flattener.unwrap_unchecked())(system, value, self.handler);
     }
 
     /// Invokes the provided pointer as a function handle with the given system and value as arguments.
@@ -241,6 +241,17 @@ impl EventInvoker {
     /// as arguments. These must both refer to valid objects of the correct system and event type.
     unsafe fn pointer_flattener<T: 'static + Send + Sync>(system: *mut (), value: &dyn Any, to_run: *const ()) {
         transmute::<_, fn(*mut (), &T)>(to_run)(system, value.downcast_ref().unwrap_unchecked())
+    }
+}
+
+impl Default for EventInvoker {
+    fn default() -> Self {
+        unsafe {
+            Self {
+                pointer_flattener: None,
+                handler: std::ptr::null_mut()
+            }
+        }
     }
 }
 
@@ -348,7 +359,8 @@ pub struct SingleThreadPool(wasm_sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>
 
 impl GeeseThreadPool for SingleThreadPool {
     fn join(&self) {
-        self.0.lock().expect("Could not acquire callback mutex.").as_ref().expect("Single thread stalled.")();
+        let work = self.0.lock().expect("Could not acquire callback mutex.").as_ref().expect("Single thread stalled.").clone();
+        work();
     }
 
     fn set_work_callback(&self, work: Option<Arc<dyn Fn() + Send + Sync>>) {

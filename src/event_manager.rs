@@ -1,7 +1,6 @@
 use bitvec::prelude::*;
 use bitvec::ptr::*;
 use crate::*;
-use crate::arena_array::*;
 use smallvec::*;
 use std::collections::vec_deque::*;
 use vecdeque_stableix::*;
@@ -108,7 +107,7 @@ impl EventManager {
         value.state = EventState::Complete;
 
         let emitted = self.receiver.get();
-        if Arc::ptr_eq(&value.event, &front_ev) {
+        if transmute::<_, &usize>(&value.event) == transmute::<_, &usize>(&front_ev) {
             self.event_lists.last_mut().unwrap_unchecked().extend(emitted);
 
             if job.id == *self.in_progress.counter() {
@@ -144,7 +143,7 @@ impl EventManager {
             && (id == start || (Self::bitmaps_exclusive(&working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(&working_transitive_dependencies_mut, deps)))
             && (main_thread || *ctx.sync_systems.get_unchecked(node.handler.system_id as usize)) {
             node.state = EventState::Processing;
-            return Some(EventJob { event: node.event.clone(), handler: node.handler, id });
+            return Some(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id });
         }
 
         *working_transitive_dependencies_bi |= deps;
@@ -158,6 +157,14 @@ impl EventManager {
             if Self::clogging_event(&*event) {
                 self.clogged_event = Some(event);
                 return None;
+            }
+            else if event.is::<notify::Delayed>() {
+                if self.in_progress.is_empty() {
+                    self.event_lists.last_mut().unwrap_unchecked().push_back(event.downcast::<notify::Delayed>().unwrap_unchecked().0);
+                }
+                else {
+                    self.in_progress.push_back(EventNode::completed(event));
+                }
             }
             else {
                 let shared = Arc::<dyn Any + Send + Sync>::from(event);
@@ -184,6 +191,9 @@ impl EventManager {
             if event.state == EventState::Complete {
                 drop(event);
                 self.event_lists.last_mut().unwrap_unchecked().extend(self.in_progress.pop_front().unwrap_unchecked().emitted_events);
+            }
+            else {
+                break;
             }
         }
     }
@@ -250,7 +260,7 @@ enum EventState {
 
 struct EventNode {
     pub emitted_events: SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>,
-    pub event: Arc<dyn Any + Send + Sync>,
+    pub event: Option<Arc<dyn Any + Send + Sync>>,
     pub handler: EventHandlerEntry,
     pub state: EventState
 }
@@ -259,9 +269,20 @@ impl EventNode {
     pub fn new(event: Arc<dyn Any + Send + Sync>, handler: EventHandlerEntry) -> Self {
         Self {
             emitted_events: SmallVec::new(),
-            event,
+            event: Some(event),
             handler,
             state: EventState::Queued
+        }
+    }
+
+    pub fn completed(event: Box<dyn Any + Send + Sync>) -> Self {
+        let mut emitted_events = SmallVec::new();
+
+        Self {
+            emitted_events,
+            event: None,
+            handler: EventHandlerEntry::default(),
+            state: EventState::Complete
         }
     }
 }
@@ -357,3 +378,8 @@ impl<'a> Iterator for ReceiverIter<'a> {
         }
     }
 }
+
+pub(crate) struct EventManagerWrapper(pub wasm_sync::Mutex<*mut EventManager>);
+
+unsafe impl Send for EventManagerWrapper {}
+unsafe impl Sync for EventManagerWrapper {}

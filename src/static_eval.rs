@@ -1,5 +1,4 @@
 /// Evaluates the provided expression in a static context on nightly, and during runtime on stable.
-#[macro_export]
 macro_rules! static_eval {
     ($assertion: expr, $result_type: ty, $($type_parameter: ident $(,)?)*) => {
         {
@@ -29,7 +28,6 @@ macro_rules! static_eval {
 }
 
 /// Evaluates the provided expression in a static context.
-#[macro_export]
 macro_rules! const_eval {
     ($assertion: expr, $result_type: ty, $($type_parameter: ident $(,)?)*) => {
         {
@@ -58,3 +56,6 @@ pub const fn const_unwrap<T: Copy>(value: Option<T>) -> T {
         panic!("Constant unwrap failed.")
     }
 }
+
+pub(crate) use const_eval;
+pub(crate) use static_eval;

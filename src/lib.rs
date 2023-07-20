@@ -7,8 +7,6 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
-mod arena_array;
-
 /// Provides the ability to create lists at compile time.
 mod const_list;
 
@@ -198,23 +196,31 @@ impl GeeseContext {
             (*inner_mgr).gather_external_events();
             drop(inner);
 
-            let mgr = Arc::new(wasm_sync::Mutex::new(inner_mgr));
-            
+            let ctx_ptr = &*self.0 as *const RwCell<ContextInner> as usize;
+
+            let mgr = Arc::new(EventManagerWrapper(wasm_sync::Mutex::new(inner_mgr)));
+            let mgr_clone = mgr.clone();
+            let callback = Arc::new_cyclic(move |weak| {
+                let weak_clone = weak.clone() as Weak<dyn Fn() + Send + Sync>;
+                move || Self::process_events(ctx_ptr as *const _, &mgr_clone.0, &weak_clone)
+            });
+
             loop {
-                while !mgr.lock().unwrap_unchecked().is_null() { Self::process_events(&*self.0, &mgr); }
+                pool.set_work_callback(Some(callback.clone()));
+                while !mgr.0.lock().unwrap_unchecked().is_null() { pool.join(); }
 
                 let state = (*inner_mgr).update_state();
 
                 match state {
                     EventManagerState::Complete() => return,
                     EventManagerState::CycleClogged(event) => {
-                        self.run_clogged_event(event);
+                        self.run_clogged_event(event, inner_mgr);
                         (*inner_mgr).gather_external_events();
                     },
                     EventManagerState::CyclesPending() => {}
                 };
 
-                *mgr.lock().unwrap_unchecked() = inner_mgr;
+                *mgr.0.lock().unwrap_unchecked() = inner_mgr;
             }
         }
     }
@@ -323,7 +329,7 @@ impl GeeseContext {
         &*self.0
     }
 
-    unsafe fn run_clogged_event(&mut self, event: Box<dyn Any + Send + Sync>) {
+    unsafe fn run_clogged_event(&mut self, event: Box<dyn Any + Send + Sync>, inner_mgr: *mut EventManager) {
         if let Some(ev) = event.downcast_ref::<notify::AddSystem>() {
             (ev.executor)(self);
         }
@@ -333,12 +339,12 @@ impl GeeseContext {
         if let Some(ev) = event.downcast_ref::<notify::ResetSystem>() {
             (ev.executor)(self);
         }
-        if let Some(ev) = event.downcast_ref::<notify::Flush>() {
-            //(ev.executor)(self);
+        if let Ok(ev) = event.downcast::<notify::Flush>() {
+            (*inner_mgr).push_event_cycle(ev.0.into_iter())
         }
     }
 
-    unsafe fn process_events(ctx: *const RwCell<ContextInner>, state: &wasm_sync::Mutex<*mut EventManager>) {
+    unsafe fn process_events(ctx: *const RwCell<ContextInner>, state: &wasm_sync::Mutex<*mut EventManager>, callback: &Weak<dyn Fn() + Send + Sync>) {
         loop {
             let mut lock_guard = state.lock().unwrap_unchecked();
             if let Some(mgr) = lock_guard.as_mut() {
@@ -349,8 +355,9 @@ impl GeeseContext {
 
                         to_run.execute(&guard);
                         (**state.lock().unwrap_unchecked()).complete_job(&to_run);
+                        guard.thread_pool.set_work_callback(Some(callback.upgrade().unwrap_unchecked()));
                     },
-                    Err(EventJobError::Busy) => { guard.notify_events_stuck(); return; },
+                    Err(EventJobError::Busy) => { guard.thread_pool.set_work_callback(None); return; },
                     Err(EventJobError::Complete) => *lock_guard = std::ptr::null_mut()
                 }
             }
@@ -421,14 +428,6 @@ impl ContextInner {
             transitive_dependencies_bi: SystemFlagsList::default(),
             transitive_dependencies_mut: SystemFlagsList::default()
         }
-    }
-
-    pub fn notify_events_available(&self) {
-
-    }
-
-    pub fn notify_events_stuck(&self) {
-
     }
 
     /// Drops all systems from the systems list. No context datastructures are modified.
@@ -1116,7 +1115,7 @@ impl EventMap {
 }
 
 /// Describes a single event handler.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 struct EventHandlerEntry {
     /// The invoker that may be used to dispatch events.
     pub handler: EventInvoker,
@@ -1160,16 +1159,36 @@ pub mod notify {
 
     /// Causes the context to delay processing the given event during
     /// the current cycle.
-    pub struct Delayed(pub(super) Cell<Option<Box<dyn Any + Send + Sync>>>);
+    pub struct Delayed(pub(crate) Box<dyn Any + Send + Sync>);
 
     /// Tells the context to delay processing this event until all of the other events
     /// placed into the queue have been processed.
     pub fn delayed<T: 'static + Send + Sync>(event: T) -> Delayed {
-        Delayed(Cell::new(Some(Box::new(event))))
+        Delayed(Box::new(event))
     }
 
     /// Instructs the Geese context to process a specific subset of events before moving to other items in the queue.
-    pub struct Flush(pub(super) Cell<Option<()>>);
+    pub struct Flush(pub(super) SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>);
+
+    impl Flush {
+        const DEFAULT_EVENT_BUFFER_SIZE: usize = 2;
+    }
+
+    pub fn flush<T: 'static + Send + Sync>(event: T) -> Flush {
+        flush_boxed(Box::new(event))
+    }
+
+    pub fn flush_boxed(event: Box<dyn Any + Send + Sync>) -> Flush {
+        flush_many_boxed(std::iter::once(event))
+    }
+
+    pub fn flush_many<T: 'static + Send + Sync>(events: impl Iterator<Item = T>) -> Flush {
+        flush_many_boxed(events.map(|x| Box::new(x) as Box<dyn Any + Send + Sync>))
+    }
+
+    pub fn flush_many_boxed(events: impl Iterator<Item = Box<dyn Any + Send + Sync>>) -> Flush {
+        Flush(events.collect::<SmallVec<_>>())
+    }
 }
 
 #[cfg(test)]
@@ -1258,6 +1277,62 @@ mod tests
         }
     }
 
+    struct E {
+        value: i32
+    }
+
+    impl GeeseSystem for E {
+        fn new(_: GeeseContextHandle<Self>) -> Self {
+            Self { value: 0 }
+        }
+    }
+
+    struct F {
+        ctx: GeeseContextHandle<Self>
+    }
+
+    impl F {
+        fn increment_value(&mut self, _: &()) {
+            self.ctx.get_mut::<E>().value += 1;
+        }
+    }
+
+    impl GeeseSystem for F {
+        const DEPENDENCIES: Dependencies = Dependencies::new()
+            .with::<Mut<E>>();
+
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::increment_value);
+
+        fn new(ctx: GeeseContextHandle<Self>) -> Self {
+            Self { ctx }
+        }
+    }
+
+    struct G {
+        ctx: GeeseContextHandle<Self>
+    }
+
+    impl G {
+        fn negate_value(&mut self, _: &()) {
+            self.ctx.get_mut::<E>().value *= -1;
+        }
+    }
+
+    impl GeeseSystem for G {
+        const DEPENDENCIES: Dependencies = Dependencies::new()
+            .with::<Mut<E>>()
+            .with::<F>();
+
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::negate_value);
+
+        fn new(ctx: GeeseContextHandle<Self>) -> Self {
+            ctx.raise_event(());
+            Self { ctx }
+        }
+    }
+
     #[test]
     fn test_single_system() {
         let ab = Arc::new(AtomicUsize::new(0));
@@ -1317,5 +1392,13 @@ mod tests
         let mut ctx = GeeseContext::default();
         ctx.raise_event(notify::remove_system::<B>());
         ctx.flush_events();
+    }
+
+    #[test]
+    fn test_mut_dependency() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<G>());
+        ctx.flush_events();
+        assert_eq!(ctx.system::<E>().value, -1);
     }
 }
