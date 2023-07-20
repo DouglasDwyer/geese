@@ -31,6 +31,7 @@ mod traits;
 use bitvec::access::*;
 use bitvec::prelude::*;
 use crate::const_list::*;
+use crate::event_manager::*;
 use crate::rw_cell::*;
 use crate::static_eval::*;
 pub use crate::traits::*;
@@ -45,7 +46,7 @@ use std::mem::*;
 use std::ops::*;
 use std::pin::*;
 use std::sync::*;
-use std::thread::*;
+use std::sync::atomic::*;
 use topological_sort::*;
 
 /// Represents a system-specific handle to a Geese context.
@@ -68,12 +69,14 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
 
     /// Raises the specified dynamically-typed event.
     pub fn raise_event_boxed(&self, event: Box<dyn Any + Send + Sync>) {
-        todo!()
+        unsafe {
+            self.inner.event_sender.lock().unwrap_unchecked().send(Event::new(event));
+        }
     }
 
     /// Raises the specified event.
     pub fn raise_event<T: 'static + Send + Sync>(&self, event: T) {
-        todo!()
+        self.raise_event_boxed(Box::new(event));
     }
 
     /// Obtains the specified system dependency.
@@ -82,7 +85,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
             let index = static_eval!(if let Some(index) = S::DEPENDENCIES.index_of::<T>() { index } else { GeeseContextHandle::<S>::panic_on_invalid_dependency() }, usize, S, T);
             let ctx = (*self.inner.context).borrow();
             let global_index = self.inner.dependency_id(index as u16) as usize;
-            assert!(*ctx.sync_systems.get_unchecked(global_index) || ctx.owning_thread == current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
+            assert!(*ctx.sync_systems.get_unchecked(global_index) || ctx.owning_thread == std::thread::current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
             let guard = ctx.systems.get_unchecked(global_index).value.borrow().detach();
             SystemRef::new(RwCellGuard::map(guard, |system| transmute::<_, &(&T, *const ())>(system).0))
         }
@@ -102,7 +105,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
             }, usize, S, T);
             let ctx = (*self.inner.context).borrow();
             let global_index = self.inner.dependency_id(index as u16) as usize;
-            assert!(*ctx.sync_systems.get_unchecked(global_index) || ctx.owning_thread == current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
+            assert!(*ctx.sync_systems.get_unchecked(global_index) || ctx.owning_thread == std::thread::current().id(), "Attempted a cross-thread borrow of a system that did not implement Sync.");
             let guard = ctx.systems.get_unchecked(global_index).value.borrow_mut().detach();
             SystemRefMut::new(RwCellGuardMut::map(guard, |system| transmute::<_, &mut (&mut T, *const ())>(system).0))
         }
@@ -123,6 +126,8 @@ struct ContextHandleInner {
     context: *const RwCell<ContextInner>,
     /// A mapping from local to global IDs of system dependencies.
     dependency_ids: SmallVec<[Cell<u16>; Self::DEFAULT_DEPENDENCY_BUFFER_SIZE]>,
+    /// A sender that may be used to raise events within the context.
+    event_sender: wasm_sync::Mutex<std::sync::mpsc::Sender<Event>>,
     /// The current ID of this system.
     id: Cell<u16>,
 }
@@ -183,6 +188,47 @@ impl ContextHandleInner {
 pub struct GeeseContext(Pin<Box<RwCell<ContextInner>>>);
 
 impl GeeseContext {
+    /// Causes an event cycle to complete by running systems until the event queue is empty.
+    pub fn flush_events(&mut self) {
+        unsafe {
+            let inner = self.0.borrow();
+            let pool = inner.thread_pool.clone();
+            let inner_mgr = inner.event_manager.get();
+            (*inner_mgr).push_external_event_cycle();
+            (*inner_mgr).gather_external_events();
+            drop(inner);
+
+            let mgr = Arc::new(wasm_sync::Mutex::new(inner_mgr));
+            
+            loop {
+                while !mgr.lock().unwrap_unchecked().is_null() { Self::process_events(&*self.0, &mgr); }
+
+                let state = (*inner_mgr).update_state();
+
+                match state {
+                    EventManagerState::Complete() => return,
+                    EventManagerState::CycleClogged(event) => {
+                        self.run_clogged_event(event);
+                        (*inner_mgr).gather_external_events();
+                    },
+                    EventManagerState::CyclesPending() => {}
+                };
+
+                *mgr.lock().unwrap_unchecked() = inner_mgr;
+            }
+        }
+    }
+
+    /// Places the given dynamically-typed event into the system event queue.
+    pub fn raise_boxed_event(&self, event: Box<dyn Any + Send + Sync>) {
+        self.0.borrow().event_sender.send(Event::new(event));
+    }
+
+    /// Places the given event into the system event queue.
+    pub fn raise_event<T: 'static + Send + Sync>(&self, event: T) {
+        self.raise_boxed_event(Box::new(event));
+    }
+
     /// Obtains a reference to the given system.
     pub fn system<S: GeeseSystem>(&self) -> SystemRef<S> {
         unsafe {
@@ -204,7 +250,7 @@ impl GeeseContext {
     }
 
     /// Adds a system to the context.
-    pub fn add_system<S: GeeseSystem>(&mut self) {
+    fn add_system<S: GeeseSystem>(&mut self) {
         unsafe {
             let mut inner = self.0.borrow_mut();
             if let Some(value) = inner.system_initializers.get(&TypeId::of::<S>()) {
@@ -223,7 +269,7 @@ impl GeeseContext {
     }
 
     /// Removes a system from the context, unloading it if it becomes disconnected from the dependency graph.
-    pub fn remove_system<S: GeeseSystem>(&mut self) {
+    fn remove_system<S: GeeseSystem>(&mut self) {
         unsafe {
             let mut inner = self.0.borrow_mut();
             inner.remove_top_level_system::<S>();
@@ -240,7 +286,7 @@ impl GeeseContext {
     }
 
     /// Reloads a system and all systems that depend upon it.
-    pub fn reset_system<S: GeeseSystem>(&mut self) {
+    fn reset_system<S: GeeseSystem>(&mut self) {
         self.0.borrow().reset_system::<S>();
     }
 
@@ -276,6 +322,43 @@ impl GeeseContext {
     fn as_ptr(&self) -> *const RwCell<ContextInner> {
         &*self.0
     }
+
+    unsafe fn run_clogged_event(&mut self, event: Box<dyn Any + Send + Sync>) {
+        if let Some(ev) = event.downcast_ref::<notify::AddSystem>() {
+            (ev.executor)(self);
+        }
+        if let Some(ev) = event.downcast_ref::<notify::RemoveSystem>() {
+            (ev.executor)(self);
+        }
+        if let Some(ev) = event.downcast_ref::<notify::ResetSystem>() {
+            (ev.executor)(self);
+        }
+        if let Some(ev) = event.downcast_ref::<notify::Flush>() {
+            //(ev.executor)(self);
+        }
+    }
+
+    unsafe fn process_events(ctx: *const RwCell<ContextInner>, state: &wasm_sync::Mutex<*mut EventManager>) {
+        loop {
+            let mut lock_guard = state.lock().unwrap_unchecked();
+            if let Some(mgr) = lock_guard.as_mut() {
+                let guard = (*ctx).borrow();
+                match mgr.next_job(&guard) {
+                    Ok(to_run) => {
+                        drop(lock_guard);
+
+                        to_run.execute(&guard);
+                        (**state.lock().unwrap_unchecked()).complete_job(&to_run);
+                    },
+                    Err(EventJobError::Busy) => { guard.notify_events_stuck(); return; },
+                    Err(EventJobError::Complete) => *lock_guard = std::ptr::null_mut()
+                }
+            }
+            else {
+                return;
+            }
+        }
+    }
 }
 
 impl Default for GeeseContext {
@@ -297,14 +380,19 @@ impl Drop for GeeseContext {
 struct ContextInner {
     /// The set of events to which systems respond.
     event_handlers: EventMap,
+    /// The manager that schedules and runs event cycles.
+    event_manager: UnsafeCell<EventManager>,
+    /// A sender that may be used to raise events within the context.
+    event_sender: std::sync::mpsc::Sender<Event>,
     /// The thread on which the context was created.
-    owning_thread: ThreadId,
+    owning_thread: std::thread::ThreadId,
     /// The set of systems which (including all dependencies) implement the `Sync` trait.
     sync_systems: BitVec,
     /// The set of currently-loaded system initializers.
     system_initializers: FxHashMap<TypeId, SystemInitializer>,
     /// The set of loaded systems.
     systems: Vec<SystemHolder>,
+    thread_pool: Arc<dyn GeeseThreadPool>,
     /// The transitive dependency lists for each system.
     transitive_dependencies: SystemFlagsList,
     /// The lists of bidirectional dependencies for each system: all systems that can reach, or are reachable from, a single system.
@@ -316,6 +404,32 @@ struct ContextInner {
 impl ContextInner {
     /// The default amount of space to allocate for processing new systems during creation.
     const DEFAULT_SYSTEM_PROCESSING_SIZE: usize = 8;
+
+    pub fn with_threadpool(pool: impl GeeseThreadPool) -> Self {
+        let (mgr, event_sender) = EventManager::new();
+
+        Self {
+            event_handlers: EventMap::default(),
+            event_manager: UnsafeCell::new(mgr),
+            event_sender,
+            owning_thread: std::thread::current().id(),
+            sync_systems: BitVec::default(),
+            system_initializers: FxHashMap::default(),
+            systems: Vec::default(),
+            thread_pool: Arc::new(pool),
+            transitive_dependencies: SystemFlagsList::default(),
+            transitive_dependencies_bi: SystemFlagsList::default(),
+            transitive_dependencies_mut: SystemFlagsList::default()
+        }
+    }
+
+    pub fn notify_events_available(&self) {
+
+    }
+
+    pub fn notify_events_stuck(&self) {
+
+    }
 
     /// Drops all systems from the systems list. No context datastructures are modified.
     /// 
@@ -393,14 +507,14 @@ impl ContextInner {
                     res
                 }
                 else {
-                    default_holder = MaybeUninit::new(SystemHolder::new(system.descriptor().system_id(), system.descriptor().dependency_len(), ctx));
+                    default_holder = MaybeUninit::new(SystemHolder::new(system.descriptor().system_id(), system.descriptor().dependency_len(), self.event_sender.clone(), ctx));
                     to_initialize.push(system.into_inner());
                     &mut default_holder
                 };
 
                 Self::update_holder_data(holder.assume_init_mut(), initializers, &system);
                 self.load_transitive_dependencies(holder.assume_init_mut(), &system);
-                self.systems.push(replace(holder, MaybeUninit::uninit()).assume_init());
+                self.systems.push(holder.assume_init_read());
 
                 self.event_handlers.add_handlers(system.id(), system.descriptor().event_handlers());
                 self.sync_systems.set_unchecked(system.id() as usize, system.descriptor().is_sync());
@@ -408,6 +522,7 @@ impl ContextInner {
 
             self.compute_sync_transitive_dependencies();
             self.compute_transitive_dependencies_bi();
+            (*self.event_manager.get()).configure(self);
 
             to_initialize
         }
@@ -480,7 +595,7 @@ impl ContextInner {
             let old_id = initializer.id();
             initializer.set_id(Self::compact_system_id(old_id, connected));
             let system_holder = old_systems.get_unchecked_mut(old_id as usize);
-            let new_system = system_view.get_unchecked_mut(initializer.id() as usize).write(replace(system_holder, MaybeUninit::uninit()).assume_init());
+            let new_system = system_view.get_unchecked_mut(initializer.id() as usize).write(system_holder.assume_init_read());
             new_system.handle.set_id(initializer.id());
             Self::compact_transitive_dependencies(new_system, connected, self.transitive_dependencies_mut.get_unchecked(old_id as usize), &mut new_transitive_dependencies, &mut new_transitive_dependencies_mut);
             self.event_handlers.add_handlers(initializer.id(), initializer.descriptor().event_handlers());
@@ -495,6 +610,7 @@ impl ContextInner {
         self.transitive_dependencies_mut = new_transitive_dependencies_mut;
         self.compute_sync_transitive_dependencies();
         self.compute_transitive_dependencies_bi();
+        (*self.event_manager.get()).configure(self);
     }
 
     /// Reloads all of the system instances that depend upon the given system.
@@ -676,16 +792,7 @@ impl ContextInner {
 
 impl Default for ContextInner {
     fn default() -> Self {
-        Self {
-            event_handlers: EventMap::default(),
-            owning_thread: current().id(),
-            sync_systems: BitVec::default(),
-            system_initializers: FxHashMap::default(),
-            systems: Vec::default(),
-            transitive_dependencies: SystemFlagsList::default(),
-            transitive_dependencies_bi: SystemFlagsList::default(),
-            transitive_dependencies_mut: SystemFlagsList::default()
-        }
+        Self::with_threadpool(SingleThreadPool::default())
     }
 }
 
@@ -786,11 +893,11 @@ impl SystemHolder {
     /// # Safety
     /// 
     /// The initial contents of the context handle must not affect the program's execution in any fashion.
-    pub unsafe fn new(system_id: TypeId, dependency_len: usize, context: *const RwCell<ContextInner>) -> Self {
+    pub unsafe fn new(system_id: TypeId, dependency_len: usize, event_sender: std::sync::mpsc::Sender<Event>, context: *const RwCell<ContextInner>) -> Self {
         let mut dependency_ids = SmallVec::with_capacity(dependency_len);
         dependency_ids.set_len(dependency_len);
         Self {
-            handle: Arc::new(ContextHandleInner { context, dependency_ids, id: Cell::new(0) }),
+            handle: Arc::new(ContextHandleInner { context, event_sender: wasm_sync::Mutex::new(event_sender), dependency_ids, id: Cell::new(0) }),
             system_id,
             value: RwCell::new(MaybeUninit::uninit())
         }
@@ -1017,138 +1124,198 @@ struct EventHandlerEntry {
     pub system_id: u16,
 }
 
+/// Provides events to which the Geese context responds.
+pub mod notify {
+    use super::*;
+
+    /// Causes Geese to load a system during the next event cycle. The context will panic if the system was already present.
+    pub struct AddSystem {
+        pub(super) executor: fn(&mut GeeseContext)
+    }
+
+    /// Tells Geese to load the specified system when this event triggers.
+    pub fn add_system<S: GeeseSystem>() -> AddSystem {
+        AddSystem { executor: GeeseContext::add_system::<S> }
+    }
+
+    /// Causes Geese to remove a system during the next event cycle. The context will panic if the system was not present.
+    pub struct RemoveSystem {
+        pub(super) executor: fn(&mut GeeseContext)
+    }
+
+    /// Tells Geese to unload the specified system when this event triggers.
+    pub fn remove_system<S: GeeseSystem>() -> RemoveSystem {
+        RemoveSystem { executor: GeeseContext::remove_system::<S> }
+    }
+
+    /// Causes Geese to reload a system during the next event cycle. The context will panic if the system was not present.
+    pub struct ResetSystem {
+        pub(super) executor: fn(&mut GeeseContext)
+    }
+
+    /// Tells Geese to reset the specified system when this event triggers.
+    pub fn reset_system<S: GeeseSystem>() -> ResetSystem {
+        ResetSystem { executor: GeeseContext::reset_system::<S> }
+    }
+
+    /// Causes the context to delay processing the given event during
+    /// the current cycle.
+    pub struct Delayed(pub(super) Cell<Option<Box<dyn Any + Send + Sync>>>);
+
+    /// Tells the context to delay processing this event until all of the other events
+    /// placed into the queue have been processed.
+    pub fn delayed<T: 'static + Send + Sync>(event: T) -> Delayed {
+        Delayed(Cell::new(Some(Box::new(event))))
+    }
+
+    /// Instructs the Geese context to process a specific subset of events before moving to other items in the queue.
+    pub struct Flush(pub(super) Cell<Option<()>>);
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
 
-    pub struct A;
-    
+    struct A;
+
     impl A {
-        fn handler(&mut self, eve: &i32) {
-            panic!("bob");
+        fn increment(&mut self, event: &Arc<AtomicUsize>) {
+            event.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub fn answer(&self) -> bool {
+            true
         }
     }
-    
+
     impl GeeseSystem for A {
-        const DEPENDENCIES: Dependencies = Dependencies::new()
-            .with::<B>()
-            .with::<C>();
-    
         const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
-            .with(Self::handler);
-    
-        fn new(ctx: GeeseContextHandle<Self>) -> Self {
-            println!("a");
-            Self
-        }
-    }
+            .with(Self::increment);
 
-    impl Drop for A {
-        fn drop(&mut self) {
-            println!("drop a");
-        }
-    }
-    
-    pub struct B;
-    
-    impl GeeseSystem for B {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<D>();
-    
         fn new(_: GeeseContextHandle<Self>) -> Self {
-            println!("b");
             Self
         }
     }
 
-    impl Drop for B {
-        fn drop(&mut self) {
-            println!("drop b");
-        }
-    }
-
-    pub struct C {
+    struct B {
         ctx: GeeseContextHandle<Self>
     }
-    
-    impl GeeseSystem for C {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<Mut<D>>();
-    
-        fn new(mut ctx: GeeseContextHandle<Self>) -> Self {
-            let mut d = ctx.get_mut::<D>();
 
-            println!("c {:?}", d.get_it());
-            d.set_it();
-            drop(d);
+    impl B {
+        fn test_answer(&mut self, event: &Arc<AtomicBool>) {
+            event.store(self.ctx.get::<A>().answer(), Ordering::Relaxed);
+        }
+    }
+
+    impl GeeseSystem for B {
+        const DEPENDENCIES: Dependencies = Dependencies::new()
+            .with::<A>();
+
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::test_answer);
+
+        fn new(ctx: GeeseContextHandle<Self>) -> Self {
+            println!("made new b");
+            ctx.raise_event(());
             Self { ctx }
         }
     }
 
-    impl Drop for C {
-        fn drop(&mut self) {
-            let d = self.ctx.get_mut::<D>();
-            println!("drop c but {:?}", d.get_it());
+    struct C {
+        counter: AtomicUsize
+    }
+
+    impl C {
+        pub fn counter(&self) -> usize {
+            self.counter.load(Ordering::Acquire)
+        }
+
+        fn increment_counter(&mut self, _: &()) {
+            self.counter.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    pub struct D(u32);
-    
-    impl D {
-        pub fn get_it(&self) -> u32 {
-            self.0
-        }
+    impl GeeseSystem for C {
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::increment_counter);
 
-        pub fn set_it(&mut self) {
-            self.0 = 95;
+        fn new(_: GeeseContextHandle<Self>) -> Self {
+            Self { counter: AtomicUsize::new(0) }
         }
     }
 
-    impl Drop for D {
-        fn drop(&mut self) {
-            println!("drop d");
-        }
-    }
+    struct D;
 
     impl GeeseSystem for D {
-        fn new(_: GeeseContextHandle<Self>) -> Self {
-            println!("d");
-            Self(29)
-        }
-    }
-
-    pub struct E;
-
-    impl GeeseSystem for E {
         const DEPENDENCIES: Dependencies = Dependencies::new()
-            .with::<D>();
+            .with::<A>()
+            .with::<C>();
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
-            println!("e");
+            ctx.get::<C>().counter.store(4, Ordering::Release);
             Self
         }
     }
 
-    impl Drop for E {
-        fn drop(&mut self) {
-            println!("drop e");
-        }
-    }
-    
     #[test]
-    fn test() {
-        let mut mgr = GeeseContext::default();
-        mgr.add_system::<D>();
-        println!("in between");
-        mgr.add_system::<A>();
-        println!("death");
-        mgr.reset_system::<D>();
-        mgr.remove_system::<A>();
+    fn test_single_system() {
+        let ab = Arc::new(AtomicUsize::new(0));
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<A>());
+        ctx.raise_event(ab.clone());
+        ctx.flush_events();
+        assert!(ab.load(Ordering::Relaxed) == 1);
     }
 
     #[test]
-    fn test_add_double() {
-        let mut mgr = GeeseContext::default();
-        mgr.add_system::<A>();
-        mgr.add_system::<E>();
+    fn test_dependent_system() {
+        let ab = Arc::new(AtomicBool::new(false));
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<B>());
+        ctx.raise_event(ab.clone());
+        ctx.flush_events();
+        assert!(ab.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_system_reload_one() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<C>());
+        ctx.raise_event(notify::add_system::<B>());
+        ctx.flush_events();
+        assert_eq!(ctx.system::<C>().counter(), 1);
+        ctx.raise_event(notify::reset_system::<A>());
+        ctx.flush_events();
+        assert_eq!(ctx.system::<C>().counter(), 2);
+    }
+
+    #[test]
+    fn test_system_reload_order() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<D>());
+        ctx.raise_event(notify::add_system::<B>());
+        ctx.flush_events();
+        assert_eq!(ctx.system::<C>().counter(), 5);
+        ctx.raise_event(notify::reset_system::<A>());
+        ctx.flush_events();
+        assert_eq!(ctx.system::<C>().counter(), 5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_system_event_twice_panic() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<B>());
+        ctx.raise_event(notify::add_system::<B>());
+        ctx.flush_events();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remove_system_event_unknown_panic() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::remove_system::<B>());
+        ctx.flush_events();
     }
 }

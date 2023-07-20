@@ -338,6 +338,24 @@ pub(crate) const fn has_duplicate_dependencies(dependencies: &Dependencies) -> b
     false
 }
 
+pub trait GeeseThreadPool: 'static + Send + Sync {
+    fn join(&self);
+    fn set_work_callback(&self, work: Option<Arc<dyn Fn() + Send + Sync>>);
+}
+
+#[derive(Default)]
+pub struct SingleThreadPool(wasm_sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
+
+impl GeeseThreadPool for SingleThreadPool {
+    fn join(&self) {
+        self.0.lock().expect("Could not acquire callback mutex.").as_ref().expect("Single thread stalled.")();
+    }
+
+    fn set_work_callback(&self, work: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.0.lock().expect("Could not acquire callback mutex.") = work;
+    }
+}
+
 /// Hides traits from being externally visible.
 mod private {
     use super::*;
