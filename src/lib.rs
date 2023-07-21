@@ -7,11 +7,11 @@
 //! systems. Systems may also declare dependencies on other systems, which allow
 //! them to borrow those systems during event processing. Geese automatically
 //! loads all system dependencies. Any struct can act as an event type, and any struct
-//! that implements `GeeseSystem` can act as a system type.
+//! that implements [`GeeseSystem`](crate::GeeseSystem) can act as a system type.
 //!
 //! The following is an example of how to use Geese to load multiple dependent systems,
 //! and propogate events between them. The example creates a Geese context,
-//! and requests that system `B` be loaded. When `flush_events` is called,
+//! and requests that system `B` be loaded. When [`flush_events`](crate::GeeseContext::flush_events) is called,
 //! system `A` is loaded first (because it is a dependency of `B`), and then
 //! system `B` is loaded. `B` receives the typed event, and responds by querying
 //! system `A` for some information.
@@ -64,6 +64,23 @@
 //! ctx.flush_events();
 //! assert!(ab.load(Ordering::Relaxed));
 //! ```
+//!
+//! ### Event processing
+//! 
+//! The following invariants are always upheld during event processing, making it easy to reason about order of execution:
+//! 
+//! - If multiple events are raised, they are processed in first-in-first-out (FIFO) order. The `notify::flush` command
+//! can be used for fine-grained control over ordering by starting embedded event cycles.
+//! - Multiple handlers for the same event on the same system are invoked in the order that they appear in the handlers list.
+//! - When processing a single event, dependencies' event handlers are always invoked before those of dependents.
+//! 
+//! ### Concurrency
+//! 
+//! Geese can use multithreading to parallelize over work, allowing independent systems to execute event handlers in tandem.
+//! Even during multithreading, all invariants of event processing are upheld - from the perspective of a single system, events still
+//! execute serially. The more systems one defines, the more parallelism is achieved.
+//! 
+//! To use Geese with multithreading, employ either the builtin [`HardwareThreadPool`](crate::HardwareThreadPool) or implement a custom threadpool with the [`GeeseThreadPool`](crate::GeeseThreadPool) trait.
 
 #![deny(warnings)]
 #![warn(missing_docs)]
