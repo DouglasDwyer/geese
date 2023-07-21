@@ -6,6 +6,7 @@ use std::collections::vec_deque::*;
 use vecdeque_stableix::*;
 
 pub(crate) struct EventManager {
+    blocked_main_event: isize,
     clogged_event: Option<Box<dyn Any + Send + Sync>>,
     event_lists: SmallVec<[VecDeque<Box<dyn Any + Send + Sync>>; Self::DEFAULT_EVENT_BUFFER_SIZE]>,
     receiver: EventReceiver,
@@ -17,10 +18,12 @@ pub(crate) struct EventManager {
 impl EventManager {
     const DEFAULT_EVENT_BUFFER_SIZE: usize = 4;
 
+    #[inline(always)]
     pub fn new() -> (Self, std::sync::mpsc::Sender<Event>) {
         let (receiver, sender) = EventReceiver::new();
 
         (Self {
+            blocked_main_event: isize::MAX,
             clogged_event: None,
             event_lists: SmallVec::new(),
             receiver,
@@ -30,6 +33,7 @@ impl EventManager {
         }, sender)
     }
 
+    #[inline(always)]
     pub fn configure(&mut self, ctx: &ContextInner) {
         debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when configuring event manager.");
 
@@ -38,6 +42,7 @@ impl EventManager {
         self.working_transitive_dependencies_mut.resize(ctx.systems.len(), false);
     }
 
+    #[inline(always)]
     pub unsafe fn update_state(&mut self) -> EventManagerState {
         if self.clogged_event.is_some() {
             EventManagerState::CycleClogged(take(&mut self.clogged_event).unwrap_unchecked())
@@ -54,10 +59,12 @@ impl EventManager {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn gather_external_events(&mut self) {
         self.event_lists.last_mut().unwrap_unchecked().extend(self.receiver.get_all().collect::<VecDeque<_>>());
     }
 
+    #[inline(always)]
     pub fn push_external_event_cycle(&mut self) {
         unsafe {
             debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
@@ -67,6 +74,7 @@ impl EventManager {
         }
     }
 
+    #[inline(always)]
     pub fn push_event_cycle(&mut self, events: impl Iterator<Item = Box<dyn Any + Send + Sync>>) {
         unsafe {
             debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
@@ -77,18 +85,32 @@ impl EventManager {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn next_job(&mut self, ctx: &ContextInner) -> Result<EventJob, EventJobError> {
         let main_thread = std::thread::current().id() == ctx.owning_thread;
+
+        if self.blocked_main_event < isize::MAX {
+            if main_thread {
+                let mut node = self.in_progress.get_mut(self.blocked_main_event).unwrap_unchecked();
+                node.state = EventState::Processing;
+                return Ok(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id: std::mem::replace(&mut self.blocked_main_event, isize::MAX) });
+            }
+            else {
+                return Err(EventJobError::MainThreadRequired);
+            }
+        }
 
         self.working_transitive_dependencies_bi.fill(false);
         self.working_transitive_dependencies_mut.fill(false);
         
         if let Some(result) = self.get_queued_job(ctx, main_thread) {
+            self.blocked_main_event = isize::MAX;
             return Ok(result);
         }
 
         if self.clogged_event.is_none() {
             if let Some(result) = self.queue_new_jobs(ctx, main_thread) {
+                self.blocked_main_event = isize::MAX;
                 return Ok(result);
             }
         }
@@ -96,11 +118,15 @@ impl EventManager {
         if self.in_progress.is_empty() {
             Err(EventJobError::Complete)
         }
+        else if self.blocked_main_event < isize::MAX {
+            Err(EventJobError::MainThreadRequired)
+        }
         else {
             Err(EventJobError::Busy)
         }
     }
 
+    #[inline(always)]
     pub unsafe fn complete_job(&mut self, job: &EventJob) {
         let front_ev = self.in_progress.front().unwrap_unchecked().event.clone();
         let value = self.in_progress.get_mut(job.id).unwrap_unchecked();
@@ -119,31 +145,39 @@ impl EventManager {
         }
     }
 
+    #[inline(always)]
     unsafe fn clear_completed_cycles(&mut self) {
         while !self.event_lists.is_empty() && self.event_lists.last().unwrap_unchecked().is_empty() {
             self.event_lists.pop();
         }
     }
 
+    #[inline(always)]
     unsafe fn get_queued_job(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
         let start = *self.in_progress.counter();
         for (id, node) in self.in_progress.iter_mut().filter(|(_, event)| event.state != EventState::Complete) {
-            if let Some(value) = Self::try_select_job(ctx, id, start, node, main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut) {
+            if let Some(value) = Self::try_select_job(ctx, id, start, node, main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut, &mut self.blocked_main_event) {
                 return Some(value);
             }
         }
         None
     }
 
-    unsafe fn try_select_job(ctx: &ContextInner, id: isize, start: isize, node: &mut EventNode, main_thread: bool, working_transitive_dependencies_bi: &mut BitVec, working_transitive_dependencies_mut: &mut BitVec) -> Option<EventJob> {
+    #[inline(always)]
+    unsafe fn try_select_job(ctx: &ContextInner, id: isize, start: isize, node: &mut EventNode, main_thread: bool, working_transitive_dependencies_bi: &mut BitVec, working_transitive_dependencies_mut: &mut BitVec, main_thread_required: &mut isize) -> Option<EventJob> {
         let deps = ctx.transitive_dependencies_bi.get_unchecked(node.handler.system_id as usize);
         let deps_mut = ctx.transitive_dependencies_mut.get_unchecked(node.handler.system_id as usize);
-        
-        if node.state == EventState::Queued
-            && (id == start || (Self::bitmaps_exclusive(&working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(&working_transitive_dependencies_mut, deps)))
-            && (main_thread || *ctx.sync_systems.get_unchecked(node.handler.system_id as usize)) {
-            node.state = EventState::Processing;
-            return Some(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id });
+
+        if node.state == EventState::Queued {
+            if main_thread || *ctx.sync_systems.get_unchecked(node.handler.system_id as usize) {
+                if id == start || (Self::bitmaps_exclusive(&working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(&working_transitive_dependencies_mut, deps)) {
+                    node.state = EventState::Processing;
+                    return Some(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id });
+                }
+            }
+            else {
+                *main_thread_required = (*main_thread_required).min(id);
+            }
         }
         
         *working_transitive_dependencies_bi |= deps;
@@ -152,6 +186,7 @@ impl EventManager {
         None
     }
 
+    #[inline(always)]
     unsafe fn queue_new_jobs(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
         while let Some(event) = self.event_lists.last_mut().unwrap_unchecked().pop_front() {
             if Self::clogging_event(&*event) {
@@ -176,7 +211,7 @@ impl EventManager {
                 }
                 
                 for id in end..self.in_progress.end_index() {
-                    if let Some(job) = Self::try_select_job(ctx, id, start, self.in_progress.get_mut(id).unwrap_unchecked(), main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut) {
+                    if let Some(job) = Self::try_select_job(ctx, id, start, self.in_progress.get_mut(id).unwrap_unchecked(), main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut, &mut self.blocked_main_event) {
                         return Some(job);
                     }
                 }
@@ -186,6 +221,7 @@ impl EventManager {
         None
     }
 
+    #[inline(always)]
     unsafe fn drop_front(&mut self) {
         while let Some(event) = self.in_progress.front() {
             if event.state == EventState::Complete {
@@ -198,6 +234,7 @@ impl EventManager {
         }
     }
 
+    #[inline(always)]
     fn clogging_event(event: &dyn Any) -> bool {
         if event.is::<notify::AddSystem>()
             || event.is::<notify::RemoveSystem>()
@@ -210,6 +247,7 @@ impl EventManager {
         }
     }
 
+    #[inline(always)]
     unsafe fn bitmaps_exclusive(a: &BitSlice, b: &BitSlice) -> bool {
         for chunk in a.chunks(usize::BITS as usize) {
             let start = chunk.as_bitptr().offset_from(a.as_bitptr()) as usize;
@@ -237,6 +275,7 @@ pub(crate) struct EventJob {
 }
 
 impl EventJob {
+    #[inline(always)]
     pub unsafe fn execute(&self, ctx: &ContextInner) {
         self.handler.handler.invoke(transmute::<_, &mut (*mut (), *const ())>(ctx.systems.get_unchecked(self.handler.system_id as usize).value.borrow_mut().assume_init_mut()).0, &*self.event);        
     }
@@ -246,7 +285,8 @@ impl EventJob {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EventJobError {
     Busy,
-    Complete
+    Complete,
+    MainThreadRequired
 }
 
 #[repr(u8)]
@@ -266,6 +306,7 @@ struct EventNode {
 }
 
 impl EventNode {
+    #[inline(always)]
     pub fn new(event: Arc<dyn Any + Send + Sync>, handler: EventHandlerEntry) -> Self {
         Self {
             emitted_events: SmallVec::new(),
@@ -275,6 +316,7 @@ impl EventNode {
         }
     }
 
+    #[inline(always)]
     pub fn completed(event: Box<dyn Any + Send + Sync>) -> Self {
         let mut emitted_events = SmallVec::new();
 
@@ -297,6 +339,7 @@ pub struct Event {
 }
 
 impl Event {
+    #[inline(always)]
     pub fn new(value: Box<dyn Any + Send + Sync>) -> Self {
         Self {
             value,
@@ -313,6 +356,7 @@ struct EventReceiver {
 impl EventReceiver {
     const DEFAULT_RECEIVED_BUFFER_SIZE: usize = 4;
 
+    #[inline(always)]
     pub fn new() -> (Self, std::sync::mpsc::Sender<Event>) {
         let event_list = SmallVec::new();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -320,15 +364,18 @@ impl EventReceiver {
         (Self { event_list, receiver }, sender)
     }
 
+    #[inline(always)]
     pub fn get(&mut self) -> impl '_ + Iterator<Item = Box<dyn Any + Send + Sync>> {
         let id = std::thread::current().id();
         self.drain_events(id).into_iter().chain(ReceiverIter { id, receiver: self })
     }
 
+    #[inline(always)]
     pub fn get_all(&mut self) -> impl '_ + Iterator<Item = Box<dyn Any + Send + Sync>> {
         self.event_list.drain(..).map(|x| x.value).chain(self.receiver.try_iter().map(|x| x.value))
     }
 
+    #[inline(always)]
     fn drain_events(&mut self, id: std::thread::ThreadId) -> SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_RECEIVED_BUFFER_SIZE]> {
         unsafe {
             let mut res = SmallVec::new();
@@ -362,6 +409,7 @@ struct ReceiverIter<'a> {
 impl<'a> Iterator for ReceiverIter<'a> {
     type Item = Box<dyn Any + Send + Sync>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             match self.receiver.receiver.try_recv() {

@@ -8,7 +8,7 @@ Geese is a game event system for Rust, built to allow modular game engine design
 In Geese, a system is a struct with internal state and a collection of associated
 event handlers. Systems can raise events and react to events raised by other
 systems. Systems may also declare dependencies on other systems, which allow
-them to immutably borrow those systems during event processing. Geese automatically
+them to borrow those systems during event processing. Geese automatically
 loads all system dependencies. Any struct can act as an event type, and any struct
 that implements `GeeseSystem` can act as a system type.
 
@@ -20,6 +20,10 @@ system `B` is loaded. `B` receives the typed event, and responds by querying
 system `A` for some information.
 
 ```rust
+# use geese::*;
+# use std::sync::*;
+# use std::sync::atomic::*;
+#
 struct A;
 
 impl A {
@@ -29,30 +33,30 @@ impl A {
 }
 
 impl GeeseSystem for A {
-    fn new(_: GeeseContextHandle) -> Self {
+    fn new(_: GeeseContextHandle<Self>) -> Self {
         Self
     }
 }
 
 struct B {
-    ctx: GeeseContextHandle
+    ctx: GeeseContextHandle<Self>
 }
 
 impl B {
     fn test_answer(&mut self, event: &Arc<AtomicBool>) {
-        event.store(self.ctx.system::<A>().answer(), Ordering::Relaxed);
+        event.store(self.ctx.get::<A>().answer(), Ordering::Relaxed);
     }
 }
 
 impl GeeseSystem for B {
-    fn new(ctx: GeeseContextHandle) -> Self {
+    const DEPENDENCIES: Dependencies = Dependencies::new()
+        .with::<A>();
+
+    const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+        .with(Self::test_answer);
+
+    fn new(ctx: GeeseContextHandle<Self>) -> Self {
         Self { ctx }
-    }
-
-    fn register(with: &mut GeeseSystemData<Self>) {
-        with.dependency::<A>();
-
-        with.event(Self::test_answer);
     }
 }
 
