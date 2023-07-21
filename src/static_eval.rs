@@ -3,17 +3,17 @@ macro_rules! static_eval {
     ($assertion: expr, $result_type: ty, $($type_parameter: ident $(,)?)*) => {
         {
             struct StaticEval<$($type_parameter: GeeseSystem, )*>(PhantomData<fn($($type_parameter, )*)>);
-            
+
             #[cfg(unstable)]
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 const VALUE: $result_type = $assertion;
-                
+
                 #[inline(never)]
                 const fn calculate() -> $result_type {
                     Self::VALUE
                 }
             }
-    
+
             #[cfg(not(unstable))]
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 #[inline(never)]
@@ -21,7 +21,7 @@ macro_rules! static_eval {
                     $assertion
                 }
             }
-    
+
             StaticEval::<$($type_parameter, )*>::calculate()
         }
     };
@@ -32,16 +32,16 @@ macro_rules! const_eval {
     ($assertion: expr, $result_type: ty, $($type_parameter: ident $(,)?)*) => {
         {
             struct StaticEval<$($type_parameter: GeeseSystem, )*>(PhantomData<fn($($type_parameter, )*)>);
-            
+
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 const VALUE: $result_type = $assertion;
-                
+
                 #[inline(never)]
                 const fn calculate() -> $result_type {
                     Self::VALUE
                 }
             }
-    
+
             StaticEval::<$($type_parameter, )*>::calculate()
         }
     };
@@ -51,8 +51,7 @@ macro_rules! const_eval {
 pub const fn const_unwrap<T: Copy>(value: Option<T>) -> T {
     if let Some(result) = value {
         result
-    }
-    else {
+    } else {
         panic!("Constant unwrap failed.")
     }
 }

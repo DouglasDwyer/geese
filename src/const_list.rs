@@ -15,12 +15,10 @@ impl<'a, T: 'a> ConstList<'a, T> {
         if let Some(value) = &self.0 {
             if index == 0 {
                 Some(&value.first)
-            }
-            else {
+            } else {
                 value.rest.get(index - 1)
             }
-        }
-        else {
+        } else {
             None
         }
     }
@@ -30,8 +28,7 @@ impl<'a, T: 'a> ConstList<'a, T> {
     pub const fn len(&self) -> usize {
         if let Some(value) = &self.0 {
             value.rest.len() + 1
-        }
-        else {
+        } else {
             0
         }
     }
@@ -40,7 +37,10 @@ impl<'a, T: 'a> ConstList<'a, T> {
     /// producing a new list head.
     #[inline(always)]
     pub const fn push(&'a self, value: T) -> Self {
-        ConstList(Some(ConstListItem { first: value, rest: self }))
+        ConstList(Some(ConstListItem {
+            first: value,
+            rest: self,
+        }))
     }
 
     /// Removes the first item (if any) from this list, and produces
@@ -49,8 +49,7 @@ impl<'a, T: 'a> ConstList<'a, T> {
     pub const fn pop(&'a self) -> (Option<&T>, &'a Self) {
         if let Some(value) = &self.0 {
             (Some(&value.first), value.rest)
-        }
-        else {
+        } else {
             (None, self)
         }
     }
@@ -73,13 +72,13 @@ struct ConstListItem<'a, T: 'a> {
     /// The item represented by this node.
     first: T,
     /// The rest of the list.
-    rest: &'a ConstList<'a, T>
+    rest: &'a ConstList<'a, T>,
 }
 
 /// Iterates over the contents of a `ConstList`.
 pub struct ConstListIterator<'a, T> {
     /// The current list head.
-    target: &'a ConstList<'a, T>
+    target: &'a ConstList<'a, T>,
 }
 
 impl<'a, T> Iterator for ConstListIterator<'a, T> {

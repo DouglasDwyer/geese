@@ -1,6 +1,6 @@
+use crate::*;
 use bitvec::prelude::*;
 use bitvec::ptr::*;
-use crate::*;
 use smallvec::*;
 use std::collections::vec_deque::*;
 use vecdeque_stableix::*;
@@ -20,7 +20,7 @@ pub(crate) struct EventManager {
     /// A rolling list of systems that are dependents or dependencies of in-progress event nodes.
     working_transitive_dependencies_bi: BitVec,
     /// A rolling list of systems that are mutably borrowed by in-progress event nodes.
-    working_transitive_dependencies_mut: BitVec
+    working_transitive_dependencies_mut: BitVec,
 }
 
 impl EventManager {
@@ -32,25 +32,33 @@ impl EventManager {
     pub fn new() -> (Self, std::sync::mpsc::Sender<Event>) {
         let (receiver, sender) = EventReceiver::new();
 
-        (Self {
-            blocked_main_event: isize::MAX,
-            clogged_event: None,
-            event_lists: SmallVec::new(),
-            receiver,
-            in_progress: Deque::new(),
-            working_transitive_dependencies_bi: BitVec::new(),
-            working_transitive_dependencies_mut: BitVec::new()
-        }, sender)
+        (
+            Self {
+                blocked_main_event: isize::MAX,
+                clogged_event: None,
+                event_lists: SmallVec::new(),
+                receiver,
+                in_progress: Deque::new(),
+                working_transitive_dependencies_bi: BitVec::new(),
+                working_transitive_dependencies_mut: BitVec::new(),
+            },
+            sender,
+        )
     }
 
     /// Configures this event manager for interaction with the given inner context.
     #[inline(always)]
     pub fn configure(&mut self, ctx: &ContextInner) {
-        debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when configuring event manager.");
+        debug_assert!(
+            self.in_progress.is_empty(),
+            "In progress queue was not empty when configuring event manager."
+        );
 
         *self.in_progress.counter_mut() = isize::MIN;
-        self.working_transitive_dependencies_bi.resize(ctx.systems.len(), false);
-        self.working_transitive_dependencies_mut.resize(ctx.systems.len(), false);
+        self.working_transitive_dependencies_bi
+            .resize(ctx.systems.len(), false);
+        self.working_transitive_dependencies_mut
+            .resize(ctx.systems.len(), false);
     }
 
     /// Updates the state of this event manager and returns the reason that the event manager stopped processing.
@@ -59,8 +67,7 @@ impl EventManager {
         unsafe {
             if self.clogged_event.is_some() {
                 EventManagerState::CycleClogged(take(&mut self.clogged_event).unwrap_unchecked())
-            }
-            else {
+            } else {
                 debug_assert!(self.event_lists.is_empty());
                 EventManagerState::Complete()
             }
@@ -68,19 +75,25 @@ impl EventManager {
     }
 
     /// Pushes all externally-raised events onto the top event queue.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function call to be sound, the manager must have at least one event cycle active.
     #[inline(always)]
     pub unsafe fn gather_external_events(&mut self) {
-        self.event_lists.last_mut().unwrap_unchecked().extend(self.receiver.get_all().collect::<VecDeque<_>>());
+        self.event_lists
+            .last_mut()
+            .unwrap_unchecked()
+            .extend(self.receiver.get_all().collect::<VecDeque<_>>());
     }
 
     /// Begins a new externally-driven event cycle.
     #[inline(always)]
     pub fn push_external_event_cycle(&mut self) {
-        debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
+        debug_assert!(
+            self.in_progress.is_empty(),
+            "In progress queue was not empty when starting a new event cycle."
+        );
 
         self.event_lists.push(VecDeque::new());
     }
@@ -89,17 +102,23 @@ impl EventManager {
     #[inline(always)]
     pub fn push_event_cycle(&mut self, events: impl Iterator<Item = Box<dyn Any + Send + Sync>>) {
         unsafe {
-            debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
-    
+            debug_assert!(
+                self.in_progress.is_empty(),
+                "In progress queue was not empty when starting a new event cycle."
+            );
+
             self.event_lists.push(VecDeque::new());
-            self.event_lists.last_mut().unwrap_unchecked().extend(events);
+            self.event_lists
+                .last_mut()
+                .unwrap_unchecked()
+                .extend(events);
         }
     }
 
     /// Attempts to select a new job from this pipeline.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function call to be sound, this event manager must have been configured with the provided
     /// inner context. The inner context may not have changed since.
     #[inline(always)]
@@ -108,18 +127,24 @@ impl EventManager {
 
         if self.blocked_main_event < isize::MAX {
             if main_thread {
-                let mut node = self.in_progress.get_mut(self.blocked_main_event).unwrap_unchecked();
+                let mut node = self
+                    .in_progress
+                    .get_mut(self.blocked_main_event)
+                    .unwrap_unchecked();
                 node.state = EventState::Processing;
-                return Ok(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id: std::mem::replace(&mut self.blocked_main_event, isize::MAX) });
-            }
-            else {
+                return Ok(EventJob {
+                    event: node.event.as_ref().unwrap_unchecked().clone(),
+                    handler: node.handler,
+                    id: std::mem::replace(&mut self.blocked_main_event, isize::MAX),
+                });
+            } else {
                 return Err(EventJobError::MainThreadRequired);
             }
         }
 
         self.working_transitive_dependencies_bi.fill(false);
         self.working_transitive_dependencies_mut.fill(false);
-        
+
         if let Some(result) = self.get_queued_job(ctx, main_thread) {
             self.blocked_main_event = isize::MAX;
             return Ok(result);
@@ -134,19 +159,17 @@ impl EventManager {
 
         if self.in_progress.is_empty() {
             Err(EventJobError::Complete)
-        }
-        else if self.blocked_main_event < isize::MAX {
+        } else if self.blocked_main_event < isize::MAX {
             Err(EventJobError::MainThreadRequired)
-        }
-        else {
+        } else {
             Err(EventJobError::Busy)
         }
     }
 
     /// Marks the given job as complete.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function call to be sound, the job must correspond to a valid event node
     /// in this manager's event pipeline.
     #[inline(always)]
@@ -157,13 +180,15 @@ impl EventManager {
 
         let emitted = self.receiver.get();
         if transmute::<_, &usize>(&value.event) == transmute::<_, &usize>(&front_ev) {
-            self.event_lists.last_mut().unwrap_unchecked().extend(emitted);
+            self.event_lists
+                .last_mut()
+                .unwrap_unchecked()
+                .extend(emitted);
 
             if job.id == *self.in_progress.counter() {
                 self.drop_front();
             }
-        }
-        else {
+        } else {
             value.emitted_events.extend(emitted);
         }
     }
@@ -172,17 +197,21 @@ impl EventManager {
     #[inline(always)]
     unsafe fn get_queued_job(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
         let start = *self.in_progress.counter();
-        for (id, node) in self.in_progress.iter_mut().filter(|(_, event)| event.state != EventState::Complete) {
+        for (id, node) in self
+            .in_progress
+            .iter_mut()
+            .filter(|(_, event)| event.state != EventState::Complete)
+        {
             if let Some(value) = Self::try_select_job(JobSelectionParams {
-                    ctx,
-                    id,
-                    start,
-                    node,
-                    main_thread,
-                    working_transitive_dependencies_bi: &mut self.working_transitive_dependencies_bi,
-                    working_transitive_dependencies_mut: &mut self.working_transitive_dependencies_mut,
-                    main_thread_required: &mut self.blocked_main_event
-                }) {
+                ctx,
+                id,
+                start,
+                node,
+                main_thread,
+                working_transitive_dependencies_bi: &mut self.working_transitive_dependencies_bi,
+                working_transitive_dependencies_mut: &mut self.working_transitive_dependencies_mut,
+                main_thread_required: &mut self.blocked_main_event,
+            }) {
                 return Some(value);
             }
         }
@@ -192,21 +221,43 @@ impl EventManager {
     /// Attempts to select the provided event node given constraints, creating an associated job if possible.
     #[inline(always)]
     unsafe fn try_select_job(mut params: JobSelectionParams<'_>) -> Option<EventJob> {
-        let deps = params.ctx.transitive_dependencies_bi.get_unchecked(params.node.handler.system_id as usize);
-        let deps_mut = params.ctx.transitive_dependencies_mut.get_unchecked(params.node.handler.system_id as usize);
+        let deps = params
+            .ctx
+            .transitive_dependencies_bi
+            .get_unchecked(params.node.handler.system_id as usize);
+        let deps_mut = params
+            .ctx
+            .transitive_dependencies_mut
+            .get_unchecked(params.node.handler.system_id as usize);
 
         if params.node.state == EventState::Queued {
-            if params.main_thread || *params.ctx.sync_systems.get_unchecked(params.node.handler.system_id as usize) {
-                if params.id == params.start || (Self::bitmaps_exclusive(params.working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(params.working_transitive_dependencies_mut, deps)) {
+            if params.main_thread
+                || *params
+                    .ctx
+                    .sync_systems
+                    .get_unchecked(params.node.handler.system_id as usize)
+            {
+                if params.id == params.start
+                    || (Self::bitmaps_exclusive(
+                        params.working_transitive_dependencies_bi,
+                        deps_mut,
+                    ) && Self::bitmaps_exclusive(
+                        params.working_transitive_dependencies_mut,
+                        deps,
+                    ))
+                {
                     params.node.state = EventState::Processing;
-                    return Some(EventJob { event: params.node.event.as_ref().unwrap_unchecked().clone(), handler: params.node.handler, id: params.id });
+                    return Some(EventJob {
+                        event: params.node.event.as_ref().unwrap_unchecked().clone(),
+                        handler: params.node.handler,
+                        id: params.id,
+                    });
                 }
-            }
-            else {
+            } else {
                 *params.main_thread_required = (*params.main_thread_required).min(params.id);
             }
         }
-        
+
         *params.working_transitive_dependencies_bi |= deps;
         *params.working_transitive_dependencies_mut |= deps_mut;
 
@@ -221,35 +272,38 @@ impl EventManager {
                 if Self::clogging_event(&*event) {
                     self.clogged_event = Some(event);
                     return None;
-                }
-                else if event.is::<notify::Delayed>() {
+                } else if event.is::<notify::Delayed>() {
                     if self.in_progress.is_empty() {
-                        self.event_lists.last_mut().unwrap_unchecked().push_back(event.downcast::<notify::Delayed>().unwrap_unchecked().0);
-                    }
-                    else {
+                        self.event_lists
+                            .last_mut()
+                            .unwrap_unchecked()
+                            .push_back(event.downcast::<notify::Delayed>().unwrap_unchecked().0);
+                    } else {
                         self.in_progress.push_back(EventNode::completed(event));
                     }
-                }
-                else {
+                } else {
                     let shared = Arc::<dyn Any + Send + Sync>::from(event);
                     let start = *self.in_progress.counter();
                     let end = start + self.in_progress.len() as isize;
-    
+
                     for handle in ctx.event_handlers.handlers((*shared).type_id()) {
-                        self.in_progress.push_back(EventNode::new(shared.clone(), *handle));
+                        self.in_progress
+                            .push_back(EventNode::new(shared.clone(), *handle));
                     }
-                    
+
                     for id in end..self.in_progress.end_index() {
                         if let Some(job) = Self::try_select_job(JobSelectionParams {
-                                ctx,
-                                id,
-                                start,
-                                node: self.in_progress.get_mut(id).unwrap_unchecked(),
-                                main_thread,
-                                working_transitive_dependencies_bi: &mut self.working_transitive_dependencies_bi,
-                                working_transitive_dependencies_mut: &mut self.working_transitive_dependencies_mut,
-                                main_thread_required: &mut self.blocked_main_event
-                            }) {
+                            ctx,
+                            id,
+                            start,
+                            node: self.in_progress.get_mut(id).unwrap_unchecked(),
+                            main_thread,
+                            working_transitive_dependencies_bi: &mut self
+                                .working_transitive_dependencies_bi,
+                            working_transitive_dependencies_mut: &mut self
+                                .working_transitive_dependencies_mut,
+                            main_thread_required: &mut self.blocked_main_event,
+                        }) {
                             return Some(job);
                         }
                     }
@@ -262,8 +316,7 @@ impl EventManager {
                 if self.event_lists.is_empty() {
                     break;
                 }
-            }
-            else {
+            } else {
                 break;
             }
         }
@@ -277,9 +330,13 @@ impl EventManager {
     unsafe fn drop_front(&mut self) {
         while let Some(event) = self.in_progress.front() {
             if event.state == EventState::Complete {
-                self.event_lists.last_mut().unwrap_unchecked().extend(self.in_progress.pop_front().unwrap_unchecked().emitted_events);
-            }
-            else {
+                self.event_lists.last_mut().unwrap_unchecked().extend(
+                    self.in_progress
+                        .pop_front()
+                        .unwrap_unchecked()
+                        .emitted_events,
+                );
+            } else {
                 break;
             }
         }
@@ -295,9 +352,9 @@ impl EventManager {
     }
 
     /// Determines whether the two bitmaps are completely exclusive, and do not share any bits.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function call to be sound, the slices must match in length.
     #[inline(always)]
     unsafe fn bitmaps_exclusive(a: &BitSlice, b: &BitSlice) -> bool {
@@ -325,13 +382,13 @@ struct JobSelectionParams<'a> {
     /// The event node describing the job.
     node: &'a mut EventNode,
     /// Whether this is executing on the main thread.
-    main_thread: bool, 
+    main_thread: bool,
     /// The set of rolling bidirectional transitive dependencies for all previous nodes.
     working_transitive_dependencies_bi: &'a mut BitVec,
     /// The set of rolling mutable transitive dependencies for all previous nodes.
     working_transitive_dependencies_mut: &'a mut BitVec,
     /// The ID of the earliest job that requires the main thread.
-    main_thread_required: &'a mut isize
+    main_thread_required: &'a mut isize,
 }
 
 /// Represents the status of the event manager after finishing an event cycle.
@@ -339,7 +396,7 @@ pub enum EventManagerState {
     /// The cycle is complete, and all events have been processed.
     Complete(),
     /// The cycle is clogged and requires individual processing of the given event.
-    CycleClogged(Box<dyn Any + Send + Sync>)
+    CycleClogged(Box<dyn Any + Send + Sync>),
 }
 
 /// Denotes an event handler to execute.
@@ -349,18 +406,28 @@ pub(crate) struct EventJob {
     /// The handler to execute.
     pub handler: EventHandlerEntry,
     /// The ID of the job.
-    pub id: isize
+    pub id: isize,
 }
 
 impl EventJob {
     /// Executes this event job with the provided inner context.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// This job must describe a valid system and event handler presently stored in the inner context.
     #[inline(always)]
     pub unsafe fn execute(&self, ctx: &ContextInner) {
-        self.handler.handler.invoke(transmute::<_, &mut (*mut (), *const ())>(ctx.systems.get_unchecked(self.handler.system_id as usize).value.borrow_mut().assume_init_mut()).0, &*self.event);        
+        self.handler.handler.invoke(
+            transmute::<_, &mut (*mut (), *const ())>(
+                ctx.systems
+                    .get_unchecked(self.handler.system_id as usize)
+                    .value
+                    .borrow_mut()
+                    .assume_init_mut(),
+            )
+            .0,
+            &*self.event,
+        );
     }
 }
 
@@ -373,7 +440,7 @@ pub enum EventJobError {
     /// The event manager has completed an event cycle.
     Complete,
     /// The main thread is required to resolve blocking events in the queue.
-    MainThreadRequired
+    MainThreadRequired,
 }
 
 /// Describes the status of a received event.
@@ -385,7 +452,7 @@ enum EventState {
     /// A thread has selected this event and is running the handler.
     Processing,
     /// The event handler has run to completion.
-    Complete
+    Complete,
 }
 
 /// Represents an event that has been queued for processing.
@@ -397,7 +464,7 @@ struct EventNode {
     /// The event handler to run.
     pub handler: EventHandlerEntry,
     /// The state of the event.
-    pub state: EventState
+    pub state: EventState,
 }
 
 impl EventNode {
@@ -408,7 +475,7 @@ impl EventNode {
             emitted_events: SmallVec::new(),
             event: Some(event),
             handler,
-            state: EventState::Queued
+            state: EventState::Queued,
         }
     }
 
@@ -422,7 +489,7 @@ impl EventNode {
             emitted_events,
             event: None,
             handler: EventHandlerEntry::default(),
-            state: EventState::Complete
+            state: EventState::Complete,
         }
     }
 }
@@ -437,7 +504,7 @@ pub struct Event {
     /// The value of the event.
     pub value: Box<dyn Any + Send + Sync>,
     /// The thread on which the event was sent.
-    pub sender: std::thread::ThreadId
+    pub sender: std::thread::ThreadId,
 }
 
 impl Event {
@@ -446,7 +513,7 @@ impl Event {
     pub fn new(value: Box<dyn Any + Send + Sync>) -> Self {
         Self {
             value,
-            sender: std::thread::current().id()
+            sender: std::thread::current().id(),
         }
     }
 }
@@ -456,7 +523,7 @@ struct EventReceiver {
     /// Internally buffered events that are waiting for another thread to fetch them.
     event_list: SmallVec<[Event; Self::DEFAULT_RECEIVED_BUFFER_SIZE]>,
     /// The MPSC receiver to which raised events are sent.
-    receiver: std::sync::mpsc::Receiver<Event>
+    receiver: std::sync::mpsc::Receiver<Event>,
 }
 
 impl EventReceiver {
@@ -469,25 +536,39 @@ impl EventReceiver {
         let event_list = SmallVec::new();
         let (sender, receiver) = std::sync::mpsc::channel();
 
-        (Self { event_list, receiver }, sender)
+        (
+            Self {
+                event_list,
+                receiver,
+            },
+            sender,
+        )
     }
 
     /// Creates an iterator that removes and yields all events received on the current thread.
     #[inline(always)]
     pub fn get(&mut self) -> impl '_ + Iterator<Item = Box<dyn Any + Send + Sync>> {
         let id = std::thread::current().id();
-        self.drain_events(id).into_iter().chain(ReceiverIter { id, receiver: self })
+        self.drain_events(id)
+            .into_iter()
+            .chain(ReceiverIter { id, receiver: self })
     }
 
     /// Creates an iterator that removes and yields all events received.
     #[inline(always)]
     pub fn get_all(&mut self) -> impl '_ + Iterator<Item = Box<dyn Any + Send + Sync>> {
-        self.event_list.drain(..).map(|x| x.value).chain(self.receiver.try_iter().map(|x| x.value))
+        self.event_list
+            .drain(..)
+            .map(|x| x.value)
+            .chain(self.receiver.try_iter().map(|x| x.value))
     }
 
     /// Drains all stored events from the buffer which correspond to the current thread, yielding them as a vector.
     #[inline(always)]
-    fn drain_events(&mut self, id: std::thread::ThreadId) -> SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_RECEIVED_BUFFER_SIZE]> {
+    fn drain_events(
+        &mut self,
+        id: std::thread::ThreadId,
+    ) -> SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_RECEIVED_BUFFER_SIZE]> {
         unsafe {
             let mut res = SmallVec::new();
             let mut place = 0;
@@ -499,8 +580,7 @@ impl EventReceiver {
                 let event = events.get_unchecked_mut(i);
                 if event.assume_init_ref().sender == id {
                     res.push(event.assume_init_read().value);
-                }
-                else {
+                } else {
                     events.swap(place, i);
                     place += 1;
                 }
@@ -518,7 +598,7 @@ struct ReceiverIter<'a> {
     /// The ID of the current thread.
     id: std::thread::ThreadId,
     /// The event receiver to which irrelevant events should be added.
-    receiver: &'a mut EventReceiver
+    receiver: &'a mut EventReceiver,
 }
 
 impl<'a> Iterator for ReceiverIter<'a> {
@@ -531,12 +611,11 @@ impl<'a> Iterator for ReceiverIter<'a> {
                 Ok(event) => {
                     if event.sender == self.id {
                         return Some(event.value);
-                    }
-                    else {
+                    } else {
                         self.receiver.event_list.push(event);
                     }
-                },
-                _ => return None
+                }
+                _ => return None,
             }
         }
     }

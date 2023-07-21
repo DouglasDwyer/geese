@@ -1,52 +1,50 @@
-use crate::*;
 use crate::const_list::*;
 use crate::const_type_id::*;
+use crate::*;
+use private::*;
 use std::any::*;
 use std::mem::*;
-use private::*;
 
 /// Dynamically determines whether a given type implements the provided trait.
 macro_rules! implements {
-    ($name: ident, $trait: ident) => {
-        {
-            use std::cell::*;
+    ($name: ident, $trait: ident) => {{
+        use std::cell::*;
 
-            struct TraitTest<'a, T: ?Sized> {
-                is_trait: &'a Cell<bool>,
-                data: PhantomData<T>,
-            }
-    
-            impl<T: ?Sized> Clone for TraitTest<'_, T> {
-                #[inline(always)]
-                fn clone(&self) -> Self {
-                    self.is_trait.set(false);
-                    TraitTest {
-                        is_trait: self.is_trait,
-                        data: PhantomData,
-                    }
+        struct TraitTest<'a, T: ?Sized> {
+            is_trait: &'a Cell<bool>,
+            data: PhantomData<T>,
+        }
+
+        impl<T: ?Sized> Clone for TraitTest<'_, T> {
+            #[inline(always)]
+            fn clone(&self) -> Self {
+                self.is_trait.set(false);
+                TraitTest {
+                    is_trait: self.is_trait,
+                    data: PhantomData,
                 }
             }
-
-            impl<T: ?Sized + $trait> Copy for TraitTest<'_, T> {}
-    
-            let is_trait = Cell::new(true);
-    
-            _ = [TraitTest::<$name> {
-                is_trait: &is_trait,
-                data: PhantomData,
-            }]
-            .clone();
-    
-            is_trait.get()
         }
-    };
+
+        impl<T: ?Sized + $trait> Copy for TraitTest<'_, T> {}
+
+        let is_trait = Cell::new(true);
+
+        _ = [TraitTest::<$name> {
+            is_trait: &is_trait,
+            data: PhantomData,
+        }]
+        .clone();
+
+        is_trait.get()
+    }};
 }
 
 /// Represents a collection of event handlers with internal state.
 pub trait GeeseSystem: 'static + Sized {
     /// The set of dependencies that this system has.
     const DEPENDENCIES: Dependencies = Dependencies::new();
-    
+
     /// The set of events to which this system responds.
     const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new();
 
@@ -58,7 +56,7 @@ pub trait GeeseSystem: 'static + Sized {
 #[derive(Copy, Clone, Debug)]
 pub struct Dependencies {
     /// The inner list of dependencies.
-    inner: ConstList<'static, DependencyHolder>
+    inner: ConstList<'static, DependencyHolder>,
 }
 
 impl Dependencies {
@@ -66,7 +64,7 @@ impl Dependencies {
     #[inline(always)]
     pub const fn new() -> Self {
         Self {
-            inner: ConstList::new()
+            inner: ConstList::new(),
         }
     }
 
@@ -74,7 +72,7 @@ impl Dependencies {
     #[inline(always)]
     pub const fn with<S: Dependency>(&'static self) -> Self {
         Self {
-            inner: self.inner.push(DependencyHolder::new::<S>())
+            inner: self.inner.push(DependencyHolder::new::<S>()),
         }
     }
 
@@ -89,7 +87,10 @@ impl Dependencies {
     pub(crate) const fn index_of<S: GeeseSystem>(&self) -> Option<usize> {
         let mut i = 0;
         while i < self.inner.len() {
-            if const_unwrap(self.inner.get(i)).dependency_id().eq(&ConstTypeId::of::<S>()) {
+            if const_unwrap(self.inner.get(i))
+                .dependency_id()
+                .eq(&ConstTypeId::of::<S>())
+            {
                 return Some(i);
             }
             i += 1;
@@ -119,7 +120,7 @@ impl DependencyHolder {
             descriptor_getter: Self::get_descriptor::<S::System>,
             dependencies: &S::System::DEPENDENCIES,
             mutable: S::MUTABLE,
-            type_id: ConstTypeId::of::<S::System>()
+            type_id: ConstTypeId::of::<S::System>(),
         }
     }
 
@@ -155,7 +156,7 @@ pub struct EventHandlers<S: GeeseSystem> {
     /// The inner list of event handlers.
     inner: ConstList<'static, EventHandler>,
     /// Phantom data to mark the system as used.
-    data: PhantomData<fn(S)>
+    data: PhantomData<fn(S)>,
 }
 
 impl<S: GeeseSystem> EventHandlers<S> {
@@ -164,16 +165,19 @@ impl<S: GeeseSystem> EventHandlers<S> {
     pub const fn new() -> Self {
         Self {
             inner: ConstList::new(),
-            data: PhantomData
+            data: PhantomData,
         }
     }
 
     /// Adds the given event handler to the list, returning the modified list.
     #[inline(always)]
-    pub const fn with<Q: MutableRef<S>, T: 'static + Send + Sync>(&'static self, handler: fn(Q, &T)) -> Self {
+    pub const fn with<Q: MutableRef<S>, T: 'static + Send + Sync>(
+        &'static self,
+        handler: fn(Q, &T),
+    ) -> Self {
         Self {
             inner: self.inner.push(EventHandler::new(handler)),
-            data: PhantomData
+            data: PhantomData,
         }
     }
 
@@ -196,10 +200,12 @@ pub(crate) struct EventHandler {
 impl EventHandler {
     /// Creates a new event handler to wrap the given function pointer.
     #[inline(always)]
-    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
+    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(
+        handler: fn(Q, &T),
+    ) -> Self {
         Self {
             event_id: TypeId::of::<T>,
-            handler: EventInvoker::new(handler)
+            handler: EventInvoker::new(handler),
         }
     }
 
@@ -223,23 +229,25 @@ pub(crate) struct EventInvoker {
     /// and then invokes the handler.
     pointer_flattener: Option<unsafe fn(*mut (), &dyn Any, *const ())>,
     /// The handler associated with this event invoker.
-    handler: *const ()
+    handler: *const (),
 }
 
 impl EventInvoker {
     /// Creates a new event invoker to wrap the given function pointer.
     #[inline(always)]
-    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
+    pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(
+        handler: fn(Q, &T),
+    ) -> Self {
         Self {
             pointer_flattener: Some(Self::pointer_flattener::<T>),
-            handler: handler as *const ()
+            handler: handler as *const (),
         }
     }
 
     /// Invokes the event using the given system pointer and event value.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function to be sound, the system pointer must reference a valid
     /// instance of the system type associated with this event handler. No other references
     /// to the system must exist. Further, the provided value must be of the event type
@@ -250,13 +258,17 @@ impl EventInvoker {
     }
 
     /// Invokes the provided pointer as a function handle with the given system and value as arguments.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// The pointer to run must be a valid event handler function that accepts the system and value
     /// as arguments. These must both refer to valid objects of the correct system and event type.
     #[inline(always)]
-    unsafe fn pointer_flattener<T: 'static + Send + Sync>(system: *mut (), value: &dyn Any, to_run: *const ()) {
+    unsafe fn pointer_flattener<T: 'static + Send + Sync>(
+        system: *mut (),
+        value: &dyn Any,
+        to_run: *const (),
+    ) {
         transmute::<_, fn(*mut (), &T)>(to_run)(system, value.downcast_ref().unwrap_unchecked())
     }
 }
@@ -266,7 +278,7 @@ impl Default for EventInvoker {
     fn default() -> Self {
         Self {
             pointer_flattener: None,
-            handler: std::ptr::null_mut()
+            handler: std::ptr::null_mut(),
         }
     }
 }
@@ -358,7 +370,10 @@ pub(crate) const fn has_duplicate_dependencies(dependencies: &Dependencies) -> b
         let mut j = i + 1;
 
         while j < inner_deps.len() {
-            if const_unwrap(inner_deps.get(i)).dependency_id().eq(&const_unwrap(inner_deps.get(j)).dependency_id()) {
+            if const_unwrap(inner_deps.get(i))
+                .dependency_id()
+                .eq(&const_unwrap(inner_deps.get(j)).dependency_id())
+            {
                 return true;
             }
 
@@ -413,5 +428,4 @@ mod private {
     pub trait MutableRef<T> {}
 
     impl<'a, T> MutableRef<T> for &'a mut T {}
-
 }

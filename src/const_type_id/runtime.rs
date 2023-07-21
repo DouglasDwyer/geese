@@ -14,9 +14,7 @@ impl ConstTypeId {
     /// Determines whether this type ID matches another. This function may only be used in
     /// a `const` context on nightly.
     pub const fn eq(&self, other: &Self) -> bool {
-        unsafe {
-            transmute::<_, usize>(self.0) == transmute::<_, usize>(other.0)
-        }
+        unsafe { transmute::<_, usize>(self.0) == transmute::<_, usize>(other.0) }
     }
 }
 

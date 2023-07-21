@@ -8,14 +8,16 @@ use std::sync::atomic::*;
 #[derive(Debug, Default)]
 pub struct ReadCell<T> {
     /// The underlying value.
-    inner: UnsafeCell<T>
+    inner: UnsafeCell<T>,
 }
 
 impl<T> ReadCell<T> {
     /// Creates a new cell with the given value.
     #[inline(always)]
     pub const fn new(value: T) -> Self {
-        Self { inner: UnsafeCell::new(value) }
+        Self {
+            inner: UnsafeCell::new(value),
+        }
     }
 }
 
@@ -24,9 +26,7 @@ impl<T> Deref for ReadCell<T> {
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        unsafe {
-            &*self.inner.get()
-        }
+        unsafe { &*self.inner.get() }
     }
 }
 
@@ -34,7 +34,7 @@ impl<T> Deref for ReadCell<T> {
 #[derive(Debug, Default)]
 pub struct RwCell<T> {
     /// The inner cell data.
-    inner: ReadCell<RwCellInner<T>>
+    inner: ReadCell<RwCellInner<T>>,
 }
 
 impl<T> RwCell<T> {
@@ -45,7 +45,7 @@ impl<T> RwCell<T> {
             inner: ReadCell::new(RwCellInner {
                 borrow_state: AtomicU16::new(0),
                 value: UnsafeCell::new(value),
-            })
+            }),
         }
     }
 
@@ -53,10 +53,13 @@ impl<T> RwCell<T> {
     #[inline(always)]
     pub fn borrow(&self) -> RwCellGuard<T> {
         unsafe {
-            Self::abort_if(self.inner.borrow_state.fetch_add(1, Ordering::AcqRel) >= u16::MAX - 1, "Attempted to immutably borrow cell while it was mutably borrowed.");
+            Self::abort_if(
+                self.inner.borrow_state.fetch_add(1, Ordering::AcqRel) >= u16::MAX - 1,
+                "Attempted to immutably borrow cell while it was mutably borrowed.",
+            );
             RwCellGuard {
                 value: &*(self.inner.value.get() as *const T),
-                borrow_state: &self.inner.borrow_state
+                borrow_state: &self.inner.borrow_state,
             }
         }
     }
@@ -65,10 +68,13 @@ impl<T> RwCell<T> {
     #[inline(always)]
     pub fn borrow_mut(&self) -> RwCellGuardMut<T> {
         unsafe {
-            Self::abort_if(self.inner.borrow_state.swap(u16::MAX, Ordering::AcqRel) != 0, "Attempted to mutably borrow cell while other borrows already existed.");
+            Self::abort_if(
+                self.inner.borrow_state.swap(u16::MAX, Ordering::AcqRel) != 0,
+                "Attempted to mutably borrow cell while other borrows already existed.",
+            );
             RwCellGuardMut {
                 value: &mut *self.inner.value.get(),
-                borrow_state: &self.inner.borrow_state
+                borrow_state: &self.inner.borrow_state,
             }
         }
     }
@@ -109,9 +115,9 @@ pub struct RwCellGuard<'a, T: ?Sized> {
 impl<'a, T: ?Sized> RwCellGuard<'a, T> {
     /// Removes the lifetime from a guard, allowing it to be freely used in
     /// other parts of the program.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function to be sound, the underlying cell must not be moved or
     /// destroyed while this guard exists.
     #[inline(always)]
@@ -121,10 +127,14 @@ impl<'a, T: ?Sized> RwCellGuard<'a, T> {
 
     /// Creates a reference to a specific portion of a value.
     #[inline(always)]
-    pub fn map<U, F>(orig: Self, f: F) -> RwCellGuard<'a, U> where F: FnOnce(&T) -> &U, U: ?Sized {
+    pub fn map<U, F>(orig: Self, f: F) -> RwCellGuard<'a, U>
+    where
+        F: FnOnce(&T) -> &U,
+        U: ?Sized,
+    {
         let result = RwCellGuard {
             value: f(orig.value),
-            borrow_state: orig.borrow_state
+            borrow_state: orig.borrow_state,
         };
         forget(orig);
         result
@@ -159,9 +169,9 @@ pub struct RwCellGuardMut<'a, T: ?Sized> {
 impl<'a, T: ?Sized> RwCellGuardMut<'a, T> {
     /// Removes the lifetime from a guard, allowing it to be freely used in
     /// other parts of the program.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// For this function to be sound, the underlying cell must not be moved or
     /// destroyed while this guard exists.
     #[inline(always)]
@@ -171,15 +181,19 @@ impl<'a, T: ?Sized> RwCellGuardMut<'a, T> {
 
     /// Creates a reference to a specific portion of a value.
     #[inline(always)]
-    pub fn map<U, F>(orig: Self, f: F) -> RwCellGuardMut<'a, U> where F: FnOnce(&mut T) -> &mut U, U: ?Sized {
+    pub fn map<U, F>(orig: Self, f: F) -> RwCellGuardMut<'a, U>
+    where
+        F: FnOnce(&mut T) -> &mut U,
+        U: ?Sized,
+    {
         let RwCellGuardMutDestructure {
             value,
-            borrow_state
+            borrow_state,
         } = orig.into();
-        
+
         RwCellGuardMut {
             value: f(value),
-            borrow_state
+            borrow_state,
         }
     }
 }
