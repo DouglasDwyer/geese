@@ -45,10 +45,10 @@ impl B {
 }
 
 impl GeeseSystem for B {
-    const DEPENDENCIES: Dependencies = Dependencies::new()
+    const DEPENDENCIES: Dependencies = dependencies()
         .with::<A>();
 
-    const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
         .with(Self::test_answer);
 
     fn new(ctx: GeeseContextHandle<Self>) -> Self {
