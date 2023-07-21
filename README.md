@@ -67,3 +67,20 @@ ctx.raise_event(ab.clone());
 ctx.flush_events();
 assert!(ab.load(Ordering::Relaxed));
 ```
+
+### Event processing
+
+The following invariants are always upheld during event processing, making it easy to reason about order of execution:
+
+- If multiple events are raised, they are processed in first-in-first-out (FIFO) order. The `geese::notify::flush` command
+can be used for fine-grained control over ordering by starting embedded event cycles.
+- Multiple handlers for the same event on the same system are invoked in the order that they appear in the handlers list.
+- When processing a single event, dependencies' event handlers are always invoked before those of dependents.
+
+### Concurrency
+
+Geese can use multithreading to parallelize over work, allowing multiple independent systems to execute their events in tandem.
+Even during multithreading, all invariants of event processing are upheld - from the perspective of a single system, events still
+execute serially. The more systems one defines, the more parallelism is achieved.
+
+To use Geese in with multithreading, either the builtin `HardwareThreadPool` may be employed or a custom threadpool may be implemented with the `GeeseThreadPool` trait.
