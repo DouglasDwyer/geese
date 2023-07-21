@@ -20,10 +20,6 @@ system `B` is loaded. `B` receives the typed event, and responds by querying
 system `A` for some information.
 
 ```rust
-# use geese::*;
-# use std::sync::*;
-# use std::sync::atomic::*;
-#
 struct A;
 
 impl A {
