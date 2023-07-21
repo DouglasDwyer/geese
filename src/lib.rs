@@ -23,6 +23,8 @@ mod static_eval;
 /// Declares cell types that may be used for lock-free cross-thread resource sharing.
 mod rw_cell;
 
+mod thread_pool;
+
 /// Defines the core traits used to create Geese systems.
 mod traits;
 
@@ -32,6 +34,7 @@ use crate::const_list::*;
 use crate::event_manager::*;
 use crate::rw_cell::*;
 use crate::static_eval::*;
+pub use crate::thread_pool::*;
 pub use crate::traits::*;
 use fxhash::*;
 use smallvec::*;
@@ -186,6 +189,10 @@ impl ContextHandleInner {
 pub struct GeeseContext(Pin<Box<RwCell<ContextInner>>>);
 
 impl GeeseContext {
+    pub fn with_threadpool(pool: impl GeeseThreadPool) -> Self {
+        Self(Box::pin(RwCell::new(ContextInner::with_threadpool(pool))))
+    }
+
     /// Causes an event cycle to complete by running systems until the event queue is empty.
     pub fn flush_events(&mut self) {
         unsafe {
@@ -206,7 +213,7 @@ impl GeeseContext {
             });
 
             loop {
-                pool.set_work_callback(Some(callback.clone()));
+                pool.set_callback(Some(callback.clone()));
                 while !mgr.0.lock().unwrap_unchecked().is_null() { pool.join(); }
 
                 let state = (*inner_mgr).update_state();
@@ -233,6 +240,10 @@ impl GeeseContext {
     /// Places the given event into the system event queue.
     pub fn raise_event<T: 'static + Send + Sync>(&self, event: T) {
         self.raise_boxed_event(Box::new(event));
+    }
+
+    pub fn set_threadpool(&mut self, pool: impl GeeseThreadPool) {
+        self.0.borrow_mut().thread_pool = Arc::new(pool);
     }
 
     /// Obtains a reference to the given system.
@@ -355,9 +366,9 @@ impl GeeseContext {
 
                         to_run.execute(&guard);
                         (**state.lock().unwrap_unchecked()).complete_job(&to_run);
-                        guard.thread_pool.set_work_callback(Some(callback.upgrade().unwrap_unchecked()));
+                        guard.thread_pool.set_callback(Some(callback.upgrade().unwrap_unchecked()));
                     },
-                    Err(EventJobError::Busy) => { guard.thread_pool.set_work_callback(None); return; },
+                    Err(EventJobError::Busy) => { guard.thread_pool.set_callback(None); return; },
                     Err(EventJobError::Complete) => *lock_guard = std::ptr::null_mut()
                 }
             }
@@ -791,7 +802,7 @@ impl ContextInner {
 
 impl Default for ContextInner {
     fn default() -> Self {
-        Self::with_threadpool(SingleThreadPool::default())
+        Self::with_threadpool(HardwareThreadPool::default())
     }
 }
 
@@ -1333,6 +1344,73 @@ mod tests
         }
     }
 
+    struct H {
+        ctx: GeeseContextHandle<Self>
+    }
+
+    impl H {
+        fn decrement(&mut self, event: &isize) {
+            if *event > 0 {
+                self.ctx.raise_event(*event - 1);
+                println!("J on thread {:?} count {event:?}", std::thread::current().id());
+
+                if *event == 25 {
+                    self.ctx.raise_event(());
+                }
+            }
+        }
+    }
+
+    impl GeeseSystem for H {
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::decrement);
+
+        fn new(ctx: GeeseContextHandle<Self>) -> Self {
+            Self { ctx }
+        }
+    }
+
+    struct I {
+        ctx: GeeseContextHandle<Self>,
+        last_value: usize
+    }
+
+    impl I {
+        fn decrement(&mut self, event: &usize) {
+            if *event > 0 {
+                println!("I on thread {:?} count {event:?}", std::thread::current().id());
+                self.last_value = *event;
+                self.ctx.raise_event(*event - 1);
+            }
+        }
+
+        fn hit_it(&mut self, _: &()) {
+            println!("Other hit it at {:?}", self.last_value);
+        }
+    }
+
+    impl GeeseSystem for I {
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::decrement)
+            .with(Self::hit_it);
+
+        fn new(ctx: GeeseContextHandle<Self>) -> Self {
+            Self { ctx, last_value: 0 }
+        }
+    }
+
+    struct J;
+
+    impl GeeseSystem for J {
+        const DEPENDENCIES: Dependencies = Dependencies::new()
+            .with::<H>()
+            .with::<I>();
+
+        fn new(_: GeeseContextHandle<Self>) -> Self {
+            Self
+        }
+    }
+
     #[test]
     fn test_single_system() {
         let ab = Arc::new(AtomicUsize::new(0));
@@ -1400,5 +1478,14 @@ mod tests
         ctx.raise_event(notify::add_system::<G>());
         ctx.flush_events();
         assert_eq!(ctx.system::<E>().value, -1);
+    }
+
+    #[test]
+    fn test_multiple_threads() {
+        let mut ctx = GeeseContext::with_threadpool(HardwareThreadPool::new(2));
+        ctx.raise_event(notify::add_system::<J>());
+        ctx.raise_event(50usize);
+        ctx.raise_event(50isize);
+        ctx.flush_events();
     }
 }

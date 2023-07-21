@@ -75,9 +75,10 @@ impl<T> RwCell<T> {
     }
 
     /// Aborts the program if the given condition is true.
-    #[inline(always)]
+    //#[inline(always)]
     fn abort_if(condition: bool) {
         if condition {
+            panic!("Aborting due to double borrow");
             abort()
         }
     }

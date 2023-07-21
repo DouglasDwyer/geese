@@ -1,6 +1,6 @@
 [package]
 name = "geese"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/geese"
@@ -17,5 +17,16 @@ topological-sort = "0.2.2"
 vecdeque-stableix = "1.1.1"
 wasm_sync = "0.1.0"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm_thread = "0.2.0"
+
+[dev-dependencies]
+criterion = "0.5.1"
+#old_geese = { package = "geese", version = "0.2.0" }
+
 [build-dependencies]
 rustversion = "1.0.14"
+
+[[bench]]
+name = "comparative_bench"
+harness = false
