@@ -46,10 +46,10 @@
 //! }
 //!
 //! impl GeeseSystem for B {
-//!     const DEPENDENCIES: Dependencies = Dependencies::new()
+//!     const DEPENDENCIES: Dependencies = dependencies()
 //!         .with::<A>();
 //!
-//!     const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+//!     const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
 //!         .with(Self::test_answer);
 //!
 //!     fn new(ctx: GeeseContextHandle<Self>) -> Self {
@@ -97,11 +97,14 @@ mod const_type_id;
 /// Carries out event processing tasks.
 mod event_manager;
 
+/// Declares cell types that may be used for lock-free cross-thread resource sharing.
+mod rw_cell;
+
 /// Provides methods for evaluating `const` code with generics at compilation and at runtime.
 mod static_eval;
 
-/// Declares cell types that may be used for lock-free cross-thread resource sharing.
-mod rw_cell;
+/// Offers a means for easily sharing data between systems.
+mod store;
 
 /// Implements a threadpool for context multitasking.
 mod thread_pool;
@@ -113,6 +116,7 @@ use crate::const_list::*;
 use crate::event_manager::*;
 use crate::rw_cell::*;
 use crate::static_eval::*;
+pub use crate::store::*;
 pub use crate::thread_pool::*;
 pub use crate::traits::*;
 use bitvec::access::*;
@@ -1689,7 +1693,7 @@ mod tests {
     }
 
     impl GeeseSystem for A {
-        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::increment);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::increment);
 
         fn new(_: GeeseContextHandle<Self>) -> Self {
             Self
@@ -1707,9 +1711,9 @@ mod tests {
     }
 
     impl GeeseSystem for B {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<A>();
+        const DEPENDENCIES: Dependencies = dependencies().with::<A>();
 
-        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::test_answer);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::test_answer);
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             println!("made new b");
@@ -1734,7 +1738,7 @@ mod tests {
 
     impl GeeseSystem for C {
         const EVENT_HANDLERS: EventHandlers<Self> =
-            EventHandlers::new().with(Self::increment_counter);
+            event_handlers().with(Self::increment_counter);
 
         fn new(_: GeeseContextHandle<Self>) -> Self {
             Self {
@@ -1746,7 +1750,7 @@ mod tests {
     struct D;
 
     impl GeeseSystem for D {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<A>().with::<C>();
+        const DEPENDENCIES: Dependencies = dependencies().with::<A>().with::<C>();
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             ctx.get::<C>().counter.store(4, Ordering::Release);
@@ -1775,10 +1779,10 @@ mod tests {
     }
 
     impl GeeseSystem for F {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<Mut<E>>();
+        const DEPENDENCIES: Dependencies = dependencies().with::<Mut<E>>();
 
         const EVENT_HANDLERS: EventHandlers<Self> =
-            EventHandlers::new().with(Self::increment_value);
+            event_handlers().with(Self::increment_value);
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             Self { ctx }
@@ -1796,9 +1800,9 @@ mod tests {
     }
 
     impl GeeseSystem for G {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<Mut<E>>().with::<F>();
+        const DEPENDENCIES: Dependencies = dependencies().with::<Mut<E>>().with::<F>();
 
-        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::negate_value);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::negate_value);
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             ctx.raise_event(());
@@ -1828,7 +1832,7 @@ mod tests {
     }
 
     impl GeeseSystem for H {
-        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::decrement);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::decrement);
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             Self {
@@ -1861,7 +1865,7 @@ mod tests {
     }
 
     impl GeeseSystem for I {
-        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
             .with(Self::decrement)
             .with(Self::hit_it);
 
@@ -1873,7 +1877,7 @@ mod tests {
     struct J;
 
     impl GeeseSystem for J {
-        const DEPENDENCIES: Dependencies = Dependencies::new().with::<H>().with::<I>();
+        const DEPENDENCIES: Dependencies = dependencies().with::<H>().with::<I>();
 
         fn new(_: GeeseContextHandle<Self>) -> Self {
             Self
@@ -1892,7 +1896,7 @@ mod tests {
     }
 
     impl GeeseSystem for K {
-        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::increase);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::increase);
 
         fn new(_: GeeseContextHandle<Self>) -> Self {
             Self { value: 0 }

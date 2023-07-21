@@ -31,7 +31,7 @@ impl<C: Counter> SpinSystem<C> {
 }
 
 impl<C: Counter> GeeseSystem for SpinSystem<C> {
-    const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::spin);
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::spin);
 
     fn new(ctx: GeeseContextHandle<Self>) -> Self {
         Self {
@@ -221,9 +221,9 @@ impl TestDependency {
 }
 
 impl GeeseSystem for TestDependency {
-    const DEPENDENCIES: Dependencies = Dependencies::new().with::<TestDependent>();
+    const DEPENDENCIES: Dependencies = dependencies().with::<TestDependent>();
 
-    const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new().with(Self::get_it);
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::get_it);
 
     fn new(ctx: GeeseContextHandle<Self>) -> Self {
         Self { ctx }

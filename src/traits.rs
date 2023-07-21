@@ -43,10 +43,10 @@ macro_rules! implements {
 /// Represents a collection of event handlers with internal state.
 pub trait GeeseSystem: 'static + Sized {
     /// The set of dependencies that this system has.
-    const DEPENDENCIES: Dependencies = Dependencies::new();
+    const DEPENDENCIES: Dependencies = dependencies();
 
     /// The set of events to which this system responds.
-    const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new();
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers();
 
     /// Creates a new instance of the system for the given system handle.
     fn new(ctx: GeeseContextHandle<Self>) -> Self;
@@ -62,7 +62,7 @@ pub struct Dependencies {
 impl Dependencies {
     /// Creates a new, empty list of dependencies.
     #[inline(always)]
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             inner: ConstList::new(),
         }
@@ -97,6 +97,12 @@ impl Dependencies {
         }
         None
     }
+}
+
+/// Creates a new, empty list of dependencies.
+#[inline(always)]
+pub const fn dependencies() -> Dependencies {
+    Dependencies::new()
 }
 
 /// Describes a system dependency.
@@ -162,7 +168,7 @@ pub struct EventHandlers<S: GeeseSystem> {
 impl<S: GeeseSystem> EventHandlers<S> {
     /// Creates a new, empty list of event handlers.
     #[inline(always)]
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             inner: ConstList::new(),
             data: PhantomData,
@@ -186,6 +192,12 @@ impl<S: GeeseSystem> EventHandlers<S> {
     fn as_inner(&self) -> &ConstList<'_, EventHandler> {
         &self.inner
     }
+}
+
+/// Creates a new, empty list of event handlers.
+#[inline(always)]
+pub const fn event_handlers<S: GeeseSystem>() -> EventHandlers<S> {
+    EventHandlers::new()
 }
 
 /// Describes an event handler for a system.
