@@ -65,8 +65,7 @@
 //! assert!(ab.load(Ordering::Relaxed));
 //! ```
 
-/*#![deny(warnings)]*/
-#![allow(unused)]
+#![deny(warnings)]
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
@@ -86,6 +85,7 @@ mod static_eval;
 /// Declares cell types that may be used for lock-free cross-thread resource sharing.
 mod rw_cell;
 
+/// Implements a threadpool for context multitasking.
 mod thread_pool;
 
 /// Defines the core traits used to create Geese systems.
@@ -136,7 +136,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
     #[inline(always)]
     pub fn raise_event_boxed(&self, event: Box<dyn Any + Send + Sync>) {
         unsafe {
-            self.inner.event_sender.lock().unwrap_unchecked().send(Event::new(event));
+            drop(self.inner.event_sender.lock().unwrap_unchecked().send(Event::new(event)));
         }
     }
 
@@ -269,6 +269,7 @@ impl ContextHandleInner {
 pub struct GeeseContext(Pin<Box<RwCell<ContextInner>>>);
 
 impl GeeseContext {
+    /// Creates a new context that uses the given threadpool to complete event cycles.
     #[inline(always)]
     pub fn with_threadpool(pool: impl GeeseThreadPool) -> Self {
         Self(Box::pin(RwCell::new(ContextInner::with_threadpool(pool))))
@@ -305,8 +306,7 @@ impl GeeseContext {
                     EventManagerState::CycleClogged(event) => {
                         self.run_clogged_event(event, inner_mgr);
                         (*inner_mgr).gather_external_events();
-                    },
-                    EventManagerState::CyclesPending() => {}
+                    }
                 };
 
                 *mgr.0.lock().unwrap_unchecked() = inner_mgr;
@@ -317,7 +317,7 @@ impl GeeseContext {
     /// Places the given dynamically-typed event into the system event queue.
     #[inline(always)]
     pub fn raise_boxed_event(&self, event: Box<dyn Any + Send + Sync>) {
-        self.0.borrow().event_sender.send(Event::new(event));
+        drop(self.0.borrow().event_sender.send(Event::new(event)));
     }
 
     /// Places the given event into the system event queue.
@@ -326,6 +326,7 @@ impl GeeseContext {
         self.raise_boxed_event(Box::new(event));
     }
 
+    /// Specifies the threadpool that the context will use when completing event cycles.
     #[inline(always)]
     pub fn set_threadpool(&mut self, pool: impl GeeseThreadPool) {
         self.0.borrow_mut().thread_pool = Arc::new(pool);
@@ -356,6 +357,7 @@ impl GeeseContext {
     /// Adds a system to the context.
     fn add_system<S: GeeseSystem>(&mut self) {
         unsafe {
+            static_eval!(assert!(!has_duplicate_dependencies(&S::DEPENDENCIES), "System had duplicate dependencies."), (), S);
             let mut inner = self.0.borrow_mut();
             if let Some(value) = inner.system_initializers.get(&TypeId::of::<S>()) {
                 assert!(!value.top_level(), "Cannot add duplicate dependencies.");
@@ -430,6 +432,12 @@ impl GeeseContext {
         &*self.0
     }
 
+    /// Completes the execution of a clogged event based upon its type.
+    /// 
+    /// # Safety
+    /// 
+    /// The inner context must be valid and initialized, and the inner manager must be valid,
+    /// with no other outstanding mutable references.
     #[inline(always)]
     unsafe fn run_clogged_event(&mut self, event: Box<dyn Any + Send + Sync>, inner_mgr: *mut EventManager) {
         if let Some(ev) = event.downcast_ref::<notify::AddSystem>() {
@@ -446,6 +454,12 @@ impl GeeseContext {
         }
     }
 
+    /// Loads and executes events from the event manager until no new events are available.
+    /// 
+    /// # Safety
+    /// 
+    /// Context and state must refer to the same valid inner context, and must remain valid for this function's duration.
+    /// No other mutable references must exist to the event manager.
     #[inline(always)]
     unsafe fn process_events(ctx: *const RwCell<ContextInner>, state: &wasm_sync::Mutex<*mut EventManager>, callback: &Weak<dyn Fn() + Send + Sync>) {
         loop {
@@ -511,6 +525,7 @@ struct ContextInner {
     system_initializers: FxHashMap<TypeId, SystemInitializer>,
     /// The set of loaded systems.
     systems: Vec<SystemHolder>,
+    /// The threadpool with which to asynchronously coordinate context work.
     thread_pool: Arc<dyn GeeseThreadPool>,
     /// The transitive dependency lists for each system.
     transitive_dependencies: SystemFlagsList,
@@ -524,6 +539,7 @@ impl ContextInner {
     /// The default amount of space to allocate for processing new systems during creation.
     const DEFAULT_SYSTEM_PROCESSING_SIZE: usize = 8;
 
+    /// Creates a new inner context that uses the given threadpool to complete event cycles.
     #[inline(always)]
     pub fn with_threadpool(pool: impl GeeseThreadPool) -> Self {
         let (mgr, event_sender) = EventManager::new();
@@ -602,7 +618,7 @@ impl ContextInner {
             assert!(initializers.len() < u16::MAX as usize, "Maximum number of supported systems exceeded.");
             let mut old_systems = take(&mut self.systems);
             old_systems.set_len(0);
-            let mut old_system_view = old_systems.spare_capacity_mut();
+            let old_system_view = old_systems.spare_capacity_mut();
             let mut to_initialize = SmallVec::new();
 
             self.systems.reserve(initializers.len());
@@ -611,7 +627,7 @@ impl ContextInner {
             self.transitive_dependencies = SystemFlagsList::new(false, initializers.len());
             self.transitive_dependencies_mut = SystemFlagsList::new(false, initializers.len());
 
-            let mut default_holder = MaybeUninit::uninit();
+            let mut default_holder;
     
             for system in Self::topological_sort_systems(initializers) {
                 let old_id = system.id();
@@ -794,8 +810,7 @@ impl ContextInner {
 
         for i in 0..self.systems.len() {
             working_memory.clone_from_bitslice(self.transitive_dependencies.get_unchecked(i));
-            working_memory[..].not();
-            working_memory |= &self.sync_systems;
+            *working_memory[..].not() |= &self.sync_systems;
             if working_memory.all() {
                 syncs.set_unchecked(i, true);
             }
@@ -845,7 +860,7 @@ impl ContextInner {
         unsafe {
             let mut sort: TopologicalSort<SystemStateRef<'_>> = TopologicalSort::new();
             
-            for (id, state) in descriptors {
+            for state in descriptors.values() {
                 sort.insert(SystemStateRef(state));
                 for dependency in state.descriptor().dependencies().as_inner() {
                     sort.add_dependency(SystemStateRef(descriptors.get(&dependency.dependency_id().into()).unwrap_unchecked()), SystemStateRef(state));
@@ -1105,16 +1120,6 @@ impl SystemFlagsList {
     pub unsafe fn get_unchecked(&self, index: usize) -> &BitSlice {
         &*bitvec::ptr::bitslice_from_raw_parts(self.data.as_bitptr().add(index * self.stride), self.stride)
     }
-
-    /// Gets a mutable slice associated with the given system at the provided index.
-    /// 
-    /// # Safety
-    /// 
-    /// For this function to be sound, index must be less than the total number of systems.
-    #[inline(always)]
-    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut BitSlice {
-        &mut *bitvec::ptr::bitslice_from_raw_parts_mut(self.data.as_mut_bitptr().add(index * self.stride), self.stride)
-    }
 }
 
 impl BitOrAssign<&SystemFlagsList> for SystemFlagsList {
@@ -1293,34 +1298,37 @@ struct EventHandlerEntry {
 pub mod notify {
     use super::*;
 
-    /// Causes Geese to load a system during the next event cycle. The context will panic if the system was already present.
+    /// Tells Geese to load the specified system when this event triggers.
     pub(crate) struct AddSystem {
+        /// The function that executes the system addition.
         pub(super) executor: fn(&mut GeeseContext)
     }
 
-    /// Tells Geese to load the specified system when this event triggers.
+    /// Causes Geese to load a system during the next event cycle. The context will panic if the system was already present.
     #[inline(always)]
     pub fn add_system<S: GeeseSystem>() -> impl Send + Sync {
         AddSystem { executor: GeeseContext::add_system::<S> }
     }
 
-    /// Causes Geese to remove a system during the next event cycle. The context will panic if the system was not present.
+    /// Tells Geese to unload the specified system when this event triggers.
     pub(crate) struct RemoveSystem {
+        /// The function that executes the system removal.
         pub(super) executor: fn(&mut GeeseContext)
     }
 
-    /// Tells Geese to unload the specified system when this event triggers.
+    /// Causes Geese to remove a system during the next event cycle. The context will panic if the system was not present.
     #[inline(always)]
     pub fn remove_system<S: GeeseSystem>() -> impl Send + Sync {
         RemoveSystem { executor: GeeseContext::remove_system::<S> }
     }
 
-    /// Causes Geese to reload a system during the next event cycle. The context will panic if the system was not present.
+    /// Tells Geese to reset the specified system when this event triggers.
     pub(crate) struct ResetSystem {
+        /// The function that executes the system reset.
         pub(super) executor: fn(&mut GeeseContext)
     }
 
-    /// Tells Geese to reset the specified system when this event triggers.
+    /// Causes Geese to reload a system during the next event cycle. The context will panic if the system was not present.
     #[inline(always)]
     pub fn reset_system<S: GeeseSystem>() -> impl Send + Sync {
         ResetSystem { executor: GeeseContext::reset_system::<S> }
@@ -1337,28 +1345,33 @@ pub mod notify {
         Delayed(Box::new(event))
     }
 
-    /// Instructs the Geese context to process a specific subset of events before moving to other items in the queue.
+    /// Tells the context to process the events in the queue as a separate, isolated event cycle.
     pub(crate) struct Flush(pub SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>);
 
     impl Flush {
+        /// The default amount of space to allocate for items in a flush buffer.
         const DEFAULT_EVENT_BUFFER_SIZE: usize = 2;
     }
 
+    /// Instructs the Geese context to process this event, and all subevents spawned from it, before moving to other items in the queue.
     #[inline(always)]
     pub fn flush<T: 'static + Send + Sync>(event: T) -> impl Send + Sync {
         flush_boxed(Box::new(event))
     }
 
+    /// Instructs the Geese context to process this boxed event, and all subevents spawned from it, before moving to other items in the queue.
     #[inline(always)]
     pub fn flush_boxed(event: Box<dyn Any + Send + Sync>) -> impl Send + Sync {
         flush_many_boxed(std::iter::once(event))
     }
 
+    /// Instructs the Geese context to process these events, and all subevents spawned from them, before moving to other items in the queue.
     #[inline(always)]
     pub fn flush_many<T: 'static + Send + Sync>(events: impl Iterator<Item = T>) -> impl Send + Sync {
         flush_many_boxed(events.map(|x| Box::new(x) as Box<dyn Any + Send + Sync>))
     }
 
+    /// Instructs the Geese context to process these boxed events, and all subevents spawned from them, before moving to other items in the queue.
     #[inline(always)]
     pub fn flush_many_boxed(events: impl Iterator<Item = Box<dyn Any + Send + Sync>>) -> impl Send + Sync {
         Flush(events.collect::<SmallVec<_>>())

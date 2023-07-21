@@ -1,7 +1,6 @@
 use std::cell::*;
 use std::mem::*;
 use std::ops::*;
-use std::process::*;
 use std::sync::atomic::*;
 
 /// A read-only cell that allows immutable references for the inner data to
@@ -232,9 +231,10 @@ struct AbortPanic(*const str);
 
 impl AbortPanic {
     /// Immediately aborts the program with the given message.
+    #[allow(unused_variables)]
     #[inline(always)]
     fn abort(message: &str) -> ! {
-        let x = Self(message);
+        let guard = Self(message);
         panic!("{:?}", message);
     }
 }

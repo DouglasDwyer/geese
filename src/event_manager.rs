@@ -48,14 +48,8 @@ impl EventManager {
             EventManagerState::CycleClogged(take(&mut self.clogged_event).unwrap_unchecked())
         }
         else {
-            self.clear_completed_cycles();
-
-            if self.event_lists.is_empty() {
-                EventManagerState::Complete()
-            }
-            else {
-                EventManagerState::CyclesPending()
-            }
+            debug_assert!(self.event_lists.is_empty());
+            EventManagerState::Complete()
         }
     }
 
@@ -188,33 +182,46 @@ impl EventManager {
 
     #[inline(always)]
     unsafe fn queue_new_jobs(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
-        while let Some(event) = self.event_lists.last_mut().unwrap_unchecked().pop_front() {
-            if Self::clogging_event(&*event) {
-                self.clogged_event = Some(event);
-                return None;
-            }
-            else if event.is::<notify::Delayed>() {
-                if self.in_progress.is_empty() {
-                    self.event_lists.last_mut().unwrap_unchecked().push_back(event.downcast::<notify::Delayed>().unwrap_unchecked().0);
+        loop {
+            while let Some(event) = self.event_lists.last_mut().unwrap_unchecked().pop_front() {
+                if Self::clogging_event(&*event) {
+                    self.clogged_event = Some(event);
+                    return None;
+                }
+                else if event.is::<notify::Delayed>() {
+                    if self.in_progress.is_empty() {
+                        self.event_lists.last_mut().unwrap_unchecked().push_back(event.downcast::<notify::Delayed>().unwrap_unchecked().0);
+                    }
+                    else {
+                        self.in_progress.push_back(EventNode::completed(event));
+                    }
                 }
                 else {
-                    self.in_progress.push_back(EventNode::completed(event));
+                    let shared = Arc::<dyn Any + Send + Sync>::from(event);
+                    let start = *self.in_progress.counter();
+                    let end = start + self.in_progress.len() as isize;
+    
+                    for handle in ctx.event_handlers.handlers((*shared).type_id()) {
+                        self.in_progress.push_back(EventNode::new(shared.clone(), *handle));
+                    }
+                    
+                    for id in end..self.in_progress.end_index() {
+                        if let Some(job) = Self::try_select_job(ctx, id, start, self.in_progress.get_mut(id).unwrap_unchecked(), main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut, &mut self.blocked_main_event) {
+                            return Some(job);
+                        }
+                    }
+                }
+            }
+
+            if self.in_progress.is_empty() {
+                self.event_lists.pop();
+                
+                if self.event_lists.is_empty() {
+                    break;
                 }
             }
             else {
-                let shared = Arc::<dyn Any + Send + Sync>::from(event);
-                let start = *self.in_progress.counter();
-                let end = start + self.in_progress.len() as isize;
-
-                for handle in ctx.event_handlers.handlers((*shared).type_id()) {
-                    self.in_progress.push_back(EventNode::new(shared.clone(), *handle));
-                }
-                
-                for id in end..self.in_progress.end_index() {
-                    if let Some(job) = Self::try_select_job(ctx, id, start, self.in_progress.get_mut(id).unwrap_unchecked(), main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut, &mut self.blocked_main_event) {
-                        return Some(job);
-                    }
-                }
+                break;
             }
         }
 
@@ -262,50 +269,74 @@ impl EventManager {
     }
 }
 
+/// Represents the status of the event manager after finishing an event cycle.
 pub enum EventManagerState {
+    /// The cycle is complete, and all events have been processed.
     Complete(),
-    CycleClogged(Box<dyn Any + Send + Sync>),
-    CyclesPending(),
+    /// The cycle is clogged and requires individual processing of the given event.
+    CycleClogged(Box<dyn Any + Send + Sync>)
 }
 
+/// Denotes an event handler to execute.
 pub(crate) struct EventJob {
+    /// The event that provoked this handler.
     pub event: Arc<dyn Any + Send + Sync>,
+    /// The handler to execute.
     pub handler: EventHandlerEntry,
+    /// The ID of the job.
     pub id: isize
 }
 
 impl EventJob {
+    /// Executes this event job with the provided inner context.
+    /// 
+    /// # Safety
+    /// 
+    /// This job must describe a valid system and event handler presently stored in the inner context.
     #[inline(always)]
     pub unsafe fn execute(&self, ctx: &ContextInner) {
         self.handler.handler.invoke(transmute::<_, &mut (*mut (), *const ())>(ctx.systems.get_unchecked(self.handler.system_id as usize).value.borrow_mut().assume_init_mut()).0, &*self.event);        
     }
 }
 
+/// Provides a reason that a new job could not be created.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EventJobError {
+    /// All events are busy.
     Busy,
+    /// The event manager has completed an event cycle.
     Complete,
+    /// The main thread is required to resolve blocking events in the queue.
     MainThreadRequired
 }
 
-#[repr(u8)]
+/// Describes the status of a received event.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 enum EventState {
+    /// The event is queued for execution.
     #[default]
     Queued,
+    /// A thread has selected this event and is running the handler.
     Processing,
+    /// The event handler has run to completion.
     Complete
 }
 
+/// Represents an event that has been queued for processing.
 struct EventNode {
+    /// The set of events that were raised while processing this one.
     pub emitted_events: SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>,
+    /// The event that should be run, or none if this was an immediately-complete event.
     pub event: Option<Arc<dyn Any + Send + Sync>>,
+    /// The event handler to run.
     pub handler: EventHandlerEntry,
+    /// The state of the event.
     pub state: EventState
 }
 
 impl EventNode {
+    /// Creates a new event node in the queued state, for the given event and handler.
     #[inline(always)]
     pub fn new(event: Arc<dyn Any + Send + Sync>, handler: EventHandlerEntry) -> Self {
         Self {
@@ -316,9 +347,11 @@ impl EventNode {
         }
     }
 
+    /// Creates a new immediately-complete event that emits the provided object as a follow-up event.
     #[inline(always)]
     pub fn completed(event: Box<dyn Any + Send + Sync>) -> Self {
         let mut emitted_events = SmallVec::new();
+        emitted_events.push(event);
 
         Self {
             emitted_events,
@@ -330,15 +363,20 @@ impl EventNode {
 }
 
 impl EventNode {
+    /// The default amount of space to allocate for events raised as the result of another event.
     const DEFAULT_EVENT_BUFFER_SIZE: usize = 2;
 }
 
+/// Holds an event and describes the situation that raised it.
 pub struct Event {
-    value: Box<dyn Any + Send + Sync>,
-    sender: std::thread::ThreadId
+    /// The value of the event.
+    pub value: Box<dyn Any + Send + Sync>,
+    /// The thread on which the event was sent.
+    pub sender: std::thread::ThreadId
 }
 
 impl Event {
+    /// Creates a new event that is associated with the present thread.
     #[inline(always)]
     pub fn new(value: Box<dyn Any + Send + Sync>) -> Self {
         Self {
@@ -348,14 +386,19 @@ impl Event {
     }
 }
 
+/// Manages the receipt, storage, and demuxing of raised events.
 struct EventReceiver {
+    /// Internally buffered events that are waiting for another thread to fetch them.
     event_list: SmallVec<[Event; Self::DEFAULT_RECEIVED_BUFFER_SIZE]>,
+    /// The MPSC receiver to which raised events are sent.
     receiver: std::sync::mpsc::Receiver<Event>
 }
 
 impl EventReceiver {
+    /// The default amount of buffer space to allocate for newly-received events.
     const DEFAULT_RECEIVED_BUFFER_SIZE: usize = 4;
 
+    /// Creates a new, empty event receiver and an associated sender for raising events.
     #[inline(always)]
     pub fn new() -> (Self, std::sync::mpsc::Sender<Event>) {
         let event_list = SmallVec::new();
@@ -364,17 +407,20 @@ impl EventReceiver {
         (Self { event_list, receiver }, sender)
     }
 
+    /// Creates an iterator that removes and yields all events received on the current thread.
     #[inline(always)]
     pub fn get(&mut self) -> impl '_ + Iterator<Item = Box<dyn Any + Send + Sync>> {
         let id = std::thread::current().id();
         self.drain_events(id).into_iter().chain(ReceiverIter { id, receiver: self })
     }
 
+    /// Creates an iterator that removes and yields all events received.
     #[inline(always)]
     pub fn get_all(&mut self) -> impl '_ + Iterator<Item = Box<dyn Any + Send + Sync>> {
         self.event_list.drain(..).map(|x| x.value).chain(self.receiver.try_iter().map(|x| x.value))
     }
 
+    /// Drains all stored events from the buffer which correspond to the current thread, yielding them as a vector.
     #[inline(always)]
     fn drain_events(&mut self, id: std::thread::ThreadId) -> SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_RECEIVED_BUFFER_SIZE]> {
         unsafe {
@@ -401,8 +447,12 @@ impl EventReceiver {
     }
 }
 
+/// Iterates over all new events received from an MPSC receiver, yielding the relevant ones
+/// and storing the others in the event receiver's buffer.
 struct ReceiverIter<'a> {
+    /// The ID of the current thread.
     id: std::thread::ThreadId,
+    /// The event receiver to which irrelevant events should be added.
     receiver: &'a mut EventReceiver
 }
 
@@ -427,6 +477,7 @@ impl<'a> Iterator for ReceiverIter<'a> {
     }
 }
 
+/// Wraps an event manager and marks it as threadsafe.
 pub(crate) struct EventManagerWrapper(pub wasm_sync::Mutex<*mut EventManager>);
 
 unsafe impl Send for EventManagerWrapper {}

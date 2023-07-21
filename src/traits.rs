@@ -230,11 +230,9 @@ impl EventInvoker {
     /// Creates a new event invoker to wrap the given function pointer.
     #[inline(always)]
     pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
-        unsafe {
-            Self {
-                pointer_flattener: Some(Self::pointer_flattener::<T>),
-                handler: handler as *const ()
-            }
+        Self {
+            pointer_flattener: Some(Self::pointer_flattener::<T>),
+            handler: handler as *const ()
         }
     }
 
@@ -266,11 +264,9 @@ impl EventInvoker {
 impl Default for EventInvoker {
     #[inline(always)]
     fn default() -> Self {
-        unsafe {
-            Self {
-                pointer_flattener: None,
-                handler: std::ptr::null_mut()
-            }
+        Self {
+            pointer_flattener: None,
+            handler: std::ptr::null_mut()
         }
     }
 }
@@ -375,9 +371,14 @@ pub(crate) const fn has_duplicate_dependencies(dependencies: &Dependencies) -> b
     false
 }
 
+/// Provides a backing implementation for multithreaded Geese contexts. This trait
+/// allows for defining and customizing how multiple threads complete the work of a context.
 pub trait GeeseThreadPool: 'static + Send + Sync {
+    /// Joins the threadpool by executing the specified callback (or any other background work)
+    /// on the calling thread.
     fn join(&self);
 
+    /// Sets a callback that threadpool workers should repeatedly invoke.
     fn set_callback(&self, callback: Option<Arc<dyn Fn() + Send + Sync>>);
 }
 
