@@ -77,6 +77,7 @@ mod const_list;
 #[cfg_attr(not(unstable), path = "const_type_id/runtime.rs")]
 mod const_type_id;
 
+/// Carries out event processing tasks.
 mod event_manager;
 
 /// Provides methods for evaluating `const` code with generics at compilation and at runtime.
@@ -1367,14 +1368,14 @@ pub mod notify {
 
     /// Instructs the Geese context to process these events, and all subevents spawned from them, before moving to other items in the queue.
     #[inline(always)]
-    pub fn flush_many<T: 'static + Send + Sync>(events: impl Iterator<Item = T>) -> impl Send + Sync {
-        flush_many_boxed(events.map(|x| Box::new(x) as Box<dyn Any + Send + Sync>))
+    pub fn flush_many<T: 'static + Send + Sync>(events: impl IntoIterator<Item = T>) -> impl Send + Sync {
+        flush_many_boxed(events.into_iter().map(|x| Box::new(x) as Box<dyn Any + Send + Sync>))
     }
 
     /// Instructs the Geese context to process these boxed events, and all subevents spawned from them, before moving to other items in the queue.
     #[inline(always)]
-    pub fn flush_many_boxed(events: impl Iterator<Item = Box<dyn Any + Send + Sync>>) -> impl Send + Sync {
-        Flush(events.collect::<SmallVec<_>>())
+    pub fn flush_many_boxed(events: impl IntoIterator<Item = Box<dyn Any + Send + Sync>>) -> impl Send + Sync {
+        Flush(events.into_iter().collect::<SmallVec<_>>())
     }
 }
 
@@ -1588,6 +1589,26 @@ mod tests
         }
     }
 
+    struct K {
+        value: i32
+    }
+
+    impl K {
+        fn increase(&mut self, value: &i32) {
+            assert!(*value > self.value);
+            self.value = *value;
+        }
+    }
+
+    impl GeeseSystem for K {
+        const EVENT_HANDLERS: EventHandlers<Self> = EventHandlers::new()
+            .with(Self::increase);
+
+        fn new(_: GeeseContextHandle<Self>) -> Self {
+            Self { value: 0 }
+        }
+    }
+
     #[test]
     fn test_single_system() {
         let ab = Arc::new(AtomicUsize::new(0));
@@ -1663,6 +1684,28 @@ mod tests
         ctx.raise_event(notify::add_system::<J>());
         ctx.raise_event(50usize);
         ctx.raise_event(50isize);
+        ctx.flush_events();
+    }
+
+    #[test]
+    fn test_flush() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<K>());
+        ctx.raise_event(1i32);
+        ctx.raise_event(notify::flush_many(&[2i32, 3]));
+        ctx.raise_event(4i32);
+        ctx.flush_events();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_no_flush() {
+        let mut ctx = GeeseContext::default();
+        ctx.raise_event(notify::add_system::<K>());
+        ctx.raise_event(1i32);
+        ctx.raise_event(4i32);
+        ctx.raise_event(2i32);
+        ctx.raise_event(3i32);
         ctx.flush_events();
     }
 }

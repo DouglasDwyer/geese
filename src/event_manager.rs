@@ -5,19 +5,29 @@ use smallvec::*;
 use std::collections::vec_deque::*;
 use vecdeque_stableix::*;
 
+/// Organizes the receipt and delegation of event handling.
 pub(crate) struct EventManager {
+    /// The index of the nearest blocking event that requires the main thread to execute it.
     blocked_main_event: isize,
+    /// An event that has stalled the event pipeline, if any.
     clogged_event: Option<Box<dyn Any + Send + Sync>>,
+    /// A stack of event queues, which holds events that have not yet entered the processing pipeline.
     event_lists: SmallVec<[VecDeque<Box<dyn Any + Send + Sync>>; Self::DEFAULT_EVENT_BUFFER_SIZE]>,
+    /// The receiver that collates new events.
     receiver: EventReceiver,
+    /// The queue of event nodes that are undergoing processing.
     in_progress: Deque<EventNode, isize>,
+    /// A rolling list of systems that are dependents or dependencies of in-progress event nodes.
     working_transitive_dependencies_bi: BitVec,
+    /// A rolling list of systems that are mutably borrowed by in-progress event nodes.
     working_transitive_dependencies_mut: BitVec
 }
 
 impl EventManager {
+    /// The default amount of space to allocate for objects in an event queue.
     const DEFAULT_EVENT_BUFFER_SIZE: usize = 4;
 
+    /// Creates a new, empty event manager and an associated sender for raising events.
     #[inline(always)]
     pub fn new() -> (Self, std::sync::mpsc::Sender<Event>) {
         let (receiver, sender) = EventReceiver::new();
@@ -33,6 +43,7 @@ impl EventManager {
         }, sender)
     }
 
+    /// Configures this event manager for interaction with the given inner context.
     #[inline(always)]
     pub fn configure(&mut self, ctx: &ContextInner) {
         debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when configuring event manager.");
@@ -42,43 +53,55 @@ impl EventManager {
         self.working_transitive_dependencies_mut.resize(ctx.systems.len(), false);
     }
 
+    /// Updates the state of this event manager and returns the reason that the event manager stopped processing.
     #[inline(always)]
-    pub unsafe fn update_state(&mut self) -> EventManagerState {
-        if self.clogged_event.is_some() {
-            EventManagerState::CycleClogged(take(&mut self.clogged_event).unwrap_unchecked())
-        }
-        else {
-            debug_assert!(self.event_lists.is_empty());
-            EventManagerState::Complete()
+    pub fn update_state(&mut self) -> EventManagerState {
+        unsafe {
+            if self.clogged_event.is_some() {
+                EventManagerState::CycleClogged(take(&mut self.clogged_event).unwrap_unchecked())
+            }
+            else {
+                debug_assert!(self.event_lists.is_empty());
+                EventManagerState::Complete()
+            }
         }
     }
 
+    /// Pushes all externally-raised events onto the top event queue.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be sound, the manager must have at least one event cycle active.
     #[inline(always)]
     pub unsafe fn gather_external_events(&mut self) {
         self.event_lists.last_mut().unwrap_unchecked().extend(self.receiver.get_all().collect::<VecDeque<_>>());
     }
 
+    /// Begins a new externally-driven event cycle.
     #[inline(always)]
     pub fn push_external_event_cycle(&mut self) {
-        unsafe {
-            debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
-    
-            self.clear_completed_cycles();
-            self.event_lists.push(VecDeque::new());
-        }
+        debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
+
+        self.event_lists.push(VecDeque::new());
     }
 
+    /// Pushes a new event cycle onto the pipeline stack with the given list of events.
     #[inline(always)]
     pub fn push_event_cycle(&mut self, events: impl Iterator<Item = Box<dyn Any + Send + Sync>>) {
         unsafe {
             debug_assert!(self.in_progress.is_empty(), "In progress queue was not empty when starting a new event cycle.");
     
-            self.clear_completed_cycles();
             self.event_lists.push(VecDeque::new());
             self.event_lists.last_mut().unwrap_unchecked().extend(events);
         }
     }
 
+    /// Attempts to select a new job from this pipeline.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be sound, this event manager must have been configured with the provided
+    /// inner context. The inner context may not have changed since.
     #[inline(always)]
     pub unsafe fn next_job(&mut self, ctx: &ContextInner) -> Result<EventJob, EventJobError> {
         let main_thread = std::thread::current().id() == ctx.owning_thread;
@@ -120,6 +143,12 @@ impl EventManager {
         }
     }
 
+    /// Marks the given job as complete.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be sound, the job must correspond to a valid event node
+    /// in this manager's event pipeline.
     #[inline(always)]
     pub unsafe fn complete_job(&mut self, job: &EventJob) {
         let front_ev = self.in_progress.front().unwrap_unchecked().event.clone();
@@ -139,47 +168,52 @@ impl EventManager {
         }
     }
 
-    #[inline(always)]
-    unsafe fn clear_completed_cycles(&mut self) {
-        while !self.event_lists.is_empty() && self.event_lists.last().unwrap_unchecked().is_empty() {
-            self.event_lists.pop();
-        }
-    }
-
+    /// Attempts to select a job from the list of available event nodes in the event pipeline.
     #[inline(always)]
     unsafe fn get_queued_job(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
         let start = *self.in_progress.counter();
         for (id, node) in self.in_progress.iter_mut().filter(|(_, event)| event.state != EventState::Complete) {
-            if let Some(value) = Self::try_select_job(ctx, id, start, node, main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut, &mut self.blocked_main_event) {
+            if let Some(value) = Self::try_select_job(JobSelectionParams {
+                    ctx,
+                    id,
+                    start,
+                    node,
+                    main_thread,
+                    working_transitive_dependencies_bi: &mut self.working_transitive_dependencies_bi,
+                    working_transitive_dependencies_mut: &mut self.working_transitive_dependencies_mut,
+                    main_thread_required: &mut self.blocked_main_event
+                }) {
                 return Some(value);
             }
         }
         None
     }
 
+    /// Attempts to select the provided event node given constraints, creating an associated job if possible.
     #[inline(always)]
-    unsafe fn try_select_job(ctx: &ContextInner, id: isize, start: isize, node: &mut EventNode, main_thread: bool, working_transitive_dependencies_bi: &mut BitVec, working_transitive_dependencies_mut: &mut BitVec, main_thread_required: &mut isize) -> Option<EventJob> {
-        let deps = ctx.transitive_dependencies_bi.get_unchecked(node.handler.system_id as usize);
-        let deps_mut = ctx.transitive_dependencies_mut.get_unchecked(node.handler.system_id as usize);
+    unsafe fn try_select_job(mut params: JobSelectionParams<'_>) -> Option<EventJob> {
+        let deps = params.ctx.transitive_dependencies_bi.get_unchecked(params.node.handler.system_id as usize);
+        let deps_mut = params.ctx.transitive_dependencies_mut.get_unchecked(params.node.handler.system_id as usize);
 
-        if node.state == EventState::Queued {
-            if main_thread || *ctx.sync_systems.get_unchecked(node.handler.system_id as usize) {
-                if id == start || (Self::bitmaps_exclusive(&working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(&working_transitive_dependencies_mut, deps)) {
-                    node.state = EventState::Processing;
-                    return Some(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id });
+        if params.node.state == EventState::Queued {
+            if params.main_thread || *params.ctx.sync_systems.get_unchecked(params.node.handler.system_id as usize) {
+                if params.id == params.start || (Self::bitmaps_exclusive(params.working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(params.working_transitive_dependencies_mut, deps)) {
+                    params.node.state = EventState::Processing;
+                    return Some(EventJob { event: params.node.event.as_ref().unwrap_unchecked().clone(), handler: params.node.handler, id: params.id });
                 }
             }
             else {
-                *main_thread_required = (*main_thread_required).min(id);
+                *params.main_thread_required = (*params.main_thread_required).min(params.id);
             }
         }
         
-        *working_transitive_dependencies_bi |= deps;
-        *working_transitive_dependencies_mut |= deps_mut;
+        *params.working_transitive_dependencies_bi |= deps;
+        *params.working_transitive_dependencies_mut |= deps_mut;
 
         None
     }
 
+    /// Queues newly-received events into the event pipeline.
     #[inline(always)]
     unsafe fn queue_new_jobs(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
         loop {
@@ -206,7 +240,16 @@ impl EventManager {
                     }
                     
                     for id in end..self.in_progress.end_index() {
-                        if let Some(job) = Self::try_select_job(ctx, id, start, self.in_progress.get_mut(id).unwrap_unchecked(), main_thread, &mut self.working_transitive_dependencies_bi, &mut self.working_transitive_dependencies_mut, &mut self.blocked_main_event) {
+                        if let Some(job) = Self::try_select_job(JobSelectionParams {
+                                ctx,
+                                id,
+                                start,
+                                node: self.in_progress.get_mut(id).unwrap_unchecked(),
+                                main_thread,
+                                working_transitive_dependencies_bi: &mut self.working_transitive_dependencies_bi,
+                                working_transitive_dependencies_mut: &mut self.working_transitive_dependencies_mut,
+                                main_thread_required: &mut self.blocked_main_event
+                            }) {
                             return Some(job);
                         }
                     }
@@ -215,7 +258,7 @@ impl EventManager {
 
             if self.in_progress.is_empty() {
                 self.event_lists.pop();
-                
+
                 if self.event_lists.is_empty() {
                     break;
                 }
@@ -228,11 +271,12 @@ impl EventManager {
         None
     }
 
+    /// Drops all events at the front of the in-progress queue that have completed, adding their events
+    /// to the emitted events list.
     #[inline(always)]
     unsafe fn drop_front(&mut self) {
         while let Some(event) = self.in_progress.front() {
             if event.state == EventState::Complete {
-                drop(event);
                 self.event_lists.last_mut().unwrap_unchecked().extend(self.in_progress.pop_front().unwrap_unchecked().emitted_events);
             }
             else {
@@ -241,19 +285,20 @@ impl EventManager {
         }
     }
 
+    /// Determines whether the given event should clog the system and force an event pipeline stall.
     #[inline(always)]
     fn clogging_event(event: &dyn Any) -> bool {
-        if event.is::<notify::AddSystem>()
+        event.is::<notify::AddSystem>()
             || event.is::<notify::RemoveSystem>()
             || event.is::<notify::ResetSystem>()
-            || event.is::<notify::Flush>() {
-            true
-        }
-        else {
-            false
-        }
+            || event.is::<notify::Flush>()
     }
 
+    /// Determines whether the two bitmaps are completely exclusive, and do not share any bits.
+    /// 
+    /// # Safety
+    /// 
+    /// For this function call to be sound, the slices must match in length.
     #[inline(always)]
     unsafe fn bitmaps_exclusive(a: &BitSlice, b: &BitSlice) -> bool {
         for chunk in a.chunks(usize::BITS as usize) {
@@ -267,6 +312,26 @@ impl EventManager {
 
         true
     }
+}
+
+/// Determines how a job should be selected.
+struct JobSelectionParams<'a> {
+    /// The inner context with which the job is associated.
+    ctx: &'a ContextInner,
+    /// The ID of the event node.
+    id: isize,
+    /// The ID of the first event node in the pipeline.
+    start: isize,
+    /// The event node describing the job.
+    node: &'a mut EventNode,
+    /// Whether this is executing on the main thread.
+    main_thread: bool, 
+    /// The set of rolling bidirectional transitive dependencies for all previous nodes.
+    working_transitive_dependencies_bi: &'a mut BitVec,
+    /// The set of rolling mutable transitive dependencies for all previous nodes.
+    working_transitive_dependencies_mut: &'a mut BitVec,
+    /// The ID of the earliest job that requires the main thread.
+    main_thread_required: &'a mut isize
 }
 
 /// Represents the status of the event manager after finishing an event cycle.
