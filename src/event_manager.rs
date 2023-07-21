@@ -79,6 +79,9 @@ impl EventManager {
 
     pub unsafe fn next_job(&mut self, ctx: &ContextInner) -> Result<EventJob, EventJobError> {
         let main_thread = std::thread::current().id() == ctx.owning_thread;
+
+        self.working_transitive_dependencies_bi.fill(false);
+        self.working_transitive_dependencies_mut.fill(false);
         
         if let Some(result) = self.get_queued_job(ctx, main_thread) {
             return Ok(result);
@@ -132,7 +135,7 @@ impl EventManager {
         None
     }
 
-    unsafe fn try_select_job(ctx: &ContextInner, id: isize, start: isize, node: &mut EventNode, main_thread: bool, working_transitive_dependencies_bi: &mut BitVec, working_transitive_dependencies_mut: &mut BitVec) -> Option<Option<EventJob>> {
+    unsafe fn try_select_job(ctx: &ContextInner, id: isize, start: isize, node: &mut EventNode, main_thread: bool, working_transitive_dependencies_bi: &mut BitVec, working_transitive_dependencies_mut: &mut BitVec) -> Option<EventJob> {
         let deps = ctx.transitive_dependencies_bi.get_unchecked(node.handler.system_id as usize);
         let deps_mut = ctx.transitive_dependencies_mut.get_unchecked(node.handler.system_id as usize);
         
@@ -140,23 +143,13 @@ impl EventManager {
             && (id == start || (Self::bitmaps_exclusive(&working_transitive_dependencies_bi, deps_mut) && Self::bitmaps_exclusive(&working_transitive_dependencies_mut, deps)))
             && (main_thread || *ctx.sync_systems.get_unchecked(node.handler.system_id as usize)) {
             node.state = EventState::Processing;
-            if !ctx.systems.get_unchecked(node.handler.system_id as usize).value.free() {
-                println!("Its d. we're on offset {:?} wit bideps {working_transitive_dependencies_bi:?} and mudeps {working_transitive_dependencies_mut:?} against {deps:?} and {deps_mut:?}", id - start);
-                return None;
-            }
-            return Some(Some(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id }));
+            return Some(EventJob { event: node.event.as_ref().unwrap_unchecked().clone(), handler: node.handler, id });
         }
+        
+        *working_transitive_dependencies_bi |= deps;
+        *working_transitive_dependencies_mut |= deps_mut;
 
-        if id == start {
-            *working_transitive_dependencies_bi |= deps;
-            *working_transitive_dependencies_mut |= deps_mut;
-        }
-        else {
-            working_transitive_dependencies_bi.copy_from_bitslice(deps);
-            working_transitive_dependencies_mut.copy_from_bitslice(deps_mut);
-        }
-
-        Some(None)
+        None
     }
 
     unsafe fn queue_new_jobs(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
