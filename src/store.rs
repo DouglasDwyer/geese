@@ -7,7 +7,7 @@ pub struct Store<T: 'static + Default> {
     /// Whether this value has already been modified, emitting a changed event as a result.
     dirty: bool,
     /// The value held by the store.
-    value: T
+    value: T,
 }
 
 impl<T: Default> Store<T> {

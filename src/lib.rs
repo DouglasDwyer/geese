@@ -1,3 +1,4 @@
+#![cfg_attr(unstable, feature(const_format_args))]
 #![cfg_attr(unstable, feature(const_type_id))]
 
 //! Geese is a game event system for Rust, built to allow modular game engine design.
@@ -11,7 +12,7 @@
 //!
 //! The following is an example of how to use Geese to load multiple dependent systems,
 //! and propogate events between them. The example creates a Geese context,
-//! and requests that system `B` be loaded. When [`flush_events`](crate::GeeseContext::flush_events) is called,
+//! and requests that system `B` be loaded. When [`flush`](crate::GeeseContext::flush) is called,
 //! system `A` is loaded first (because it is a dependency of `B`), and then
 //! system `B` is loaded. `B` receives the typed event, and responds by querying
 //! system `A` for some information.
@@ -59,27 +60,28 @@
 //!
 //! let ab = Arc::new(AtomicBool::new(false));
 //! let mut ctx = GeeseContext::default();
-//! ctx.raise_event(notify::add_system::<B>());
-//! ctx.raise_event(ab.clone());
-//! ctx.flush_events();
+//! ctx.flush(EventQueue::default()
+//!     .with(notify::add_system::<B>())
+//!     .with(ab.clone())
+//! );
 //! assert!(ab.load(Ordering::Relaxed));
 //! ```
 //!
 //! ### Event processing
-//! 
+//!
 //! The following invariants are always upheld during event processing, making it easy to reason about order of execution:
-//! 
+//!
 //! - If multiple events are raised, they are processed in first-in-first-out (FIFO) order. The `notify::flush` command
 //! can be used for fine-grained control over ordering by starting embedded event cycles.
 //! - Multiple handlers for the same event on the same system are invoked in the order that they appear in the handlers list.
 //! - When processing a single event, dependencies' event handlers are always invoked before those of dependents.
-//! 
+//!
 //! ### Concurrency
-//! 
+//!
 //! Geese can use multithreading to parallelize over work, allowing independent systems to execute event handlers in tandem.
 //! Even during multithreading, all invariants of event processing are upheld - from the perspective of a single system, events still
 //! execute serially. The more systems one defines, the more parallelism is achieved.
-//! 
+//!
 //! To use Geese with multithreading, employ either the builtin [`HardwareThreadPool`](crate::HardwareThreadPool) or implement a custom threadpool with the [`GeeseThreadPool`](crate::GeeseThreadPool) trait.
 
 #![deny(warnings)]
@@ -343,11 +345,17 @@ impl GeeseContext {
         Self(Box::pin(RwCell::new(ContextInner::with_threadpool(pool))))
     }
 
-    /// Causes an event cycle to complete by running systems until the event queue is empty.
+    /// Causes an event cycle to complete by running systems until the specified event queue and
+    /// all follow-up events have been processed.
     #[inline(always)]
-    pub fn flush_events(&mut self) {
+    pub fn flush(&mut self, queue: EventQueue) {
         unsafe {
             let inner = self.0.borrow();
+
+            for event in queue.events {
+                drop(inner.event_sender.send(Event::new(event)));
+            }
+
             let pool = inner.thread_pool.clone();
             let inner_mgr = inner.event_manager.get();
             (*inner_mgr).push_external_event_cycle();
@@ -382,18 +390,6 @@ impl GeeseContext {
                 *mgr.0.lock().unwrap_unchecked() = inner_mgr;
             }
         }
-    }
-
-    /// Places the given dynamically-typed event into the system event queue.
-    #[inline(always)]
-    pub fn raise_boxed_event(&self, event: Box<dyn Any + Send + Sync>) {
-        drop(self.0.borrow().event_sender.send(Event::new(event)));
-    }
-
-    /// Places the given event into the system event queue.
-    #[inline(always)]
-    pub fn raise_event<T: 'static + Send + Sync>(&self, event: T) {
-        self.raise_boxed_event(Box::new(event));
     }
 
     /// Specifies the threadpool that the context will use when completing event cycles.
@@ -559,7 +555,7 @@ impl GeeseContext {
             (ev.executor)(self);
         }
         if let Ok(ev) = event.downcast::<notify::Flush>() {
-            (*inner_mgr).push_event_cycle(ev.0.into_iter())
+            (*inner_mgr).push_event_cycle(ev.0.events.into_iter())
         }
     }
 
@@ -1576,6 +1572,52 @@ struct EventHandlerEntry {
     pub system_id: u16,
 }
 
+/// Describes a series of events that the context should execute.
+#[derive(Default)]
+pub struct EventQueue {
+    /// The events contained in this queue.
+    events: SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>,
+}
+
+impl EventQueue {
+    /// The default amount of space to allocate for items in an event queue.
+    const DEFAULT_EVENT_BUFFER_SIZE: usize = 4;
+
+    /// Adds a single event to the queue.
+    pub fn with<T: 'static + Send + Sync>(self, event: T) -> Self {
+        self.with_boxed(Box::new(event))
+    }
+
+    /// Adds a single boxed event to the queue.
+    pub fn with_boxed(self, event: Box<dyn Any + Send + Sync>) -> Self {
+        self.with_many_boxed(std::iter::once(event))
+    }
+
+    /// Adds list of events to the queue.
+    pub fn with_many<T: 'static + Send + Sync>(self, events: impl IntoIterator<Item = T>) -> Self {
+        self.with_many_boxed(
+            events
+                .into_iter()
+                .map(|x| Box::new(x) as Box<dyn Any + Send + Sync>),
+        )
+    }
+
+    /// Adds list of boxed events to the queue.
+    pub fn with_many_boxed(
+        mut self,
+        events: impl IntoIterator<Item = Box<dyn Any + Send + Sync>>,
+    ) -> Self {
+        self.events.extend(events.into_iter());
+        self
+    }
+}
+
+impl std::fmt::Debug for EventQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventQueue").finish()
+    }
+}
+
 /// Provides events to which the Geese context responds.
 pub mod notify {
     use super::*;
@@ -1634,45 +1676,12 @@ pub mod notify {
     }
 
     /// Tells the context to process the events in the queue as a separate, isolated event cycle.
-    pub(crate) struct Flush(
-        pub SmallVec<[Box<dyn Any + Send + Sync>; Self::DEFAULT_EVENT_BUFFER_SIZE]>,
-    );
-
-    impl Flush {
-        /// The default amount of space to allocate for items in a flush buffer.
-        const DEFAULT_EVENT_BUFFER_SIZE: usize = 2;
-    }
+    pub(crate) struct Flush(pub EventQueue);
 
     /// Instructs the Geese context to process this event, and all subevents spawned from it, before moving to other items in the queue.
     #[inline(always)]
-    pub fn flush<T: 'static + Send + Sync>(event: T) -> impl Send + Sync {
-        flush_boxed(Box::new(event))
-    }
-
-    /// Instructs the Geese context to process this boxed event, and all subevents spawned from it, before moving to other items in the queue.
-    #[inline(always)]
-    pub fn flush_boxed(event: Box<dyn Any + Send + Sync>) -> impl Send + Sync {
-        flush_many_boxed(std::iter::once(event))
-    }
-
-    /// Instructs the Geese context to process these events, and all subevents spawned from them, before moving to other items in the queue.
-    #[inline(always)]
-    pub fn flush_many<T: 'static + Send + Sync>(
-        events: impl IntoIterator<Item = T>,
-    ) -> impl Send + Sync {
-        flush_many_boxed(
-            events
-                .into_iter()
-                .map(|x| Box::new(x) as Box<dyn Any + Send + Sync>),
-        )
-    }
-
-    /// Instructs the Geese context to process these boxed events, and all subevents spawned from them, before moving to other items in the queue.
-    #[inline(always)]
-    pub fn flush_many_boxed(
-        events: impl IntoIterator<Item = Box<dyn Any + Send + Sync>>,
-    ) -> impl Send + Sync {
-        Flush(events.into_iter().collect::<SmallVec<_>>())
+    pub fn flush(queue: EventQueue) -> impl Send + Sync {
+        Flush(queue)
     }
 }
 
@@ -1737,8 +1746,7 @@ mod tests {
     }
 
     impl GeeseSystem for C {
-        const EVENT_HANDLERS: EventHandlers<Self> =
-            event_handlers().with(Self::increment_counter);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::increment_counter);
 
         fn new(_: GeeseContextHandle<Self>) -> Self {
             Self {
@@ -1781,8 +1789,7 @@ mod tests {
     impl GeeseSystem for F {
         const DEPENDENCIES: Dependencies = dependencies().with::<Mut<E>>();
 
-        const EVENT_HANDLERS: EventHandlers<Self> =
-            event_handlers().with(Self::increment_value);
+        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::increment_value);
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             Self { ctx }
@@ -1865,9 +1872,8 @@ mod tests {
     }
 
     impl GeeseSystem for I {
-        const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
-            .with(Self::decrement)
-            .with(Self::hit_it);
+        const EVENT_HANDLERS: EventHandlers<Self> =
+            event_handlers().with(Self::decrement).with(Self::hit_it);
 
         fn new(ctx: GeeseContextHandle<Self>) -> Self {
             Self { ctx, last_value: 0 }
@@ -1907,9 +1913,11 @@ mod tests {
     fn test_single_system() {
         let ab = Arc::new(AtomicUsize::new(0));
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<A>());
-        ctx.raise_event(ab.clone());
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<A>())
+                .with(ab.clone()),
+        );
         assert!(ab.load(Ordering::Relaxed) == 1);
     }
 
@@ -1917,33 +1925,37 @@ mod tests {
     fn test_dependent_system() {
         let ab = Arc::new(AtomicBool::new(false));
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<B>());
-        ctx.raise_event(ab.clone());
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<B>())
+                .with(ab.clone()),
+        );
         assert!(ab.load(Ordering::Relaxed));
     }
 
     #[test]
     fn test_system_reload_one() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<C>());
-        ctx.raise_event(notify::add_system::<B>());
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<C>())
+                .with(notify::add_system::<B>()),
+        );
         assert_eq!(ctx.system::<C>().counter(), 1);
-        ctx.raise_event(notify::reset_system::<A>());
-        ctx.flush_events();
+        ctx.flush(EventQueue::default().with(notify::reset_system::<A>()));
         assert_eq!(ctx.system::<C>().counter(), 2);
     }
 
     #[test]
     fn test_system_reload_order() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<D>());
-        ctx.raise_event(notify::add_system::<B>());
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<D>())
+                .with(notify::add_system::<B>()),
+        );
         assert_eq!(ctx.system::<C>().counter(), 5);
-        ctx.raise_event(notify::reset_system::<A>());
-        ctx.flush_events();
+        ctx.flush(EventQueue::default().with(notify::reset_system::<A>()));
         assert_eq!(ctx.system::<C>().counter(), 5);
     }
 
@@ -1951,55 +1963,61 @@ mod tests {
     #[should_panic]
     fn test_add_system_event_twice_panic() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<B>());
-        ctx.raise_event(notify::add_system::<B>());
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<B>())
+                .with(notify::add_system::<B>()),
+        );
     }
 
     #[test]
     #[should_panic]
     fn test_remove_system_event_unknown_panic() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::remove_system::<B>());
-        ctx.flush_events();
+        ctx.flush(EventQueue::default().with(notify::remove_system::<B>()));
     }
 
     #[test]
     fn test_mut_dependency() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<G>());
-        ctx.flush_events();
+        ctx.flush(EventQueue::default().with(notify::add_system::<G>()));
         assert_eq!(ctx.system::<E>().value, -1);
     }
 
     #[test]
     fn test_multiple_threads() {
         let mut ctx = GeeseContext::with_threadpool(HardwareThreadPool::new(2));
-        ctx.raise_event(notify::add_system::<J>());
-        ctx.raise_event(50usize);
-        ctx.raise_event(50isize);
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<J>())
+                .with(50usize)
+                .with(50isize),
+        );
     }
 
     #[test]
     fn test_flush() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<K>());
-        ctx.raise_event(1i32);
-        ctx.raise_event(notify::flush_many(&[2i32, 3]));
-        ctx.raise_event(4i32);
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<K>())
+                .with(1i32)
+                .with(notify::flush(EventQueue::default().with_many([2i32, 3])))
+                .with(4i32),
+        );
     }
 
     #[test]
     #[should_panic]
     fn test_no_flush() {
         let mut ctx = GeeseContext::default();
-        ctx.raise_event(notify::add_system::<K>());
-        ctx.raise_event(1i32);
-        ctx.raise_event(4i32);
-        ctx.raise_event(2i32);
-        ctx.raise_event(3i32);
-        ctx.flush_events();
+        ctx.flush(
+            EventQueue::default()
+                .with(notify::add_system::<K>())
+                .with(1i32)
+                .with(4i32)
+                .with(2i32)
+                .with(3i32),
+        );
     }
 }
