@@ -828,7 +828,6 @@ impl ContextInner {
 
             for system in self.system_initializers.values() {
                 if system.top_level() {
-                    connected_systems.set_unchecked(system.id() as usize, true);
                     connected_systems[..] |= self
                         .transitive_dependencies
                         .get_unchecked(system.id() as usize);
@@ -898,10 +897,14 @@ impl ContextInner {
         let mut new_transitive_dependencies_mut =
             SystemFlagsList::new(false, self.system_initializers.len());
 
-        for initializer in self.system_initializers.values() {
-            let old_id = initializer.id();
-            initializer.set_id(Self::compact_system_id(old_id, connected));
-            let system_holder = old_systems.get_unchecked_mut(old_id as usize);
+        for old_id in connected.iter_ones() {
+            let system_holder = old_systems.get_unchecked_mut(old_id);
+            let initializer = self
+                .system_initializers
+                .get(&system_holder.assume_init_ref().system_id)
+                .unwrap_unchecked();
+            initializer.set_id(Self::compact_system_id(old_id as u16, connected));
+
             let new_system = system_view
                 .get_unchecked_mut(initializer.id() as usize)
                 .write(system_holder.assume_init_read());
@@ -909,8 +912,7 @@ impl ContextInner {
             Self::compact_transitive_dependencies(
                 new_system,
                 connected,
-                self.transitive_dependencies_mut
-                    .get_unchecked(old_id as usize),
+                self.transitive_dependencies_mut.get_unchecked(old_id),
                 &mut new_transitive_dependencies,
                 &mut new_transitive_dependencies_mut,
             );
@@ -2005,6 +2007,7 @@ mod tests {
                 .with(notify::flush(EventQueue::default().with_many([2i32, 3])))
                 .with(4i32),
         );
+        assert!(ctx.system::<K>().value == 4);
     }
 
     #[test]
