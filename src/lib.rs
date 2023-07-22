@@ -400,7 +400,7 @@ impl GeeseContext {
 
     /// Obtains a reference to the given system.
     #[inline(always)]
-    pub fn system<S: GeeseSystem>(&self) -> SystemRef<S> {
+    pub fn get<S: GeeseSystem>(&self) -> SystemRef<S> {
         unsafe {
             let inner = self.0.borrow();
             let index = inner
@@ -422,7 +422,7 @@ impl GeeseContext {
 
     /// Mutably obtains a reference to the given system.
     #[inline(always)]
-    pub fn system_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<S> {
+    pub fn get_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<S> {
         unsafe {
             let inner = self.0.borrow();
             let index = inner
@@ -1943,9 +1943,9 @@ mod tests {
                 .with(notify::add_system::<C>())
                 .with(notify::add_system::<B>()),
         );
-        assert_eq!(ctx.system::<C>().counter(), 1);
+        assert_eq!(ctx.get::<C>().counter(), 1);
         ctx.flush(EventQueue::default().with(notify::reset_system::<A>()));
-        assert_eq!(ctx.system::<C>().counter(), 2);
+        assert_eq!(ctx.get::<C>().counter(), 2);
     }
 
     #[test]
@@ -1956,9 +1956,9 @@ mod tests {
                 .with(notify::add_system::<D>())
                 .with(notify::add_system::<B>()),
         );
-        assert_eq!(ctx.system::<C>().counter(), 5);
+        assert_eq!(ctx.get::<C>().counter(), 5);
         ctx.flush(EventQueue::default().with(notify::reset_system::<A>()));
-        assert_eq!(ctx.system::<C>().counter(), 5);
+        assert_eq!(ctx.get::<C>().counter(), 5);
     }
 
     #[test]
@@ -1983,7 +1983,7 @@ mod tests {
     fn test_mut_dependency() {
         let mut ctx = GeeseContext::default();
         ctx.flush(EventQueue::default().with(notify::add_system::<G>()));
-        assert_eq!(ctx.system::<E>().value, -1);
+        assert_eq!(ctx.get::<E>().value, -1);
     }
 
     #[test]
@@ -2007,7 +2007,7 @@ mod tests {
                 .with(notify::flush(EventQueue::default().with_many([2i32, 3])))
                 .with(4i32),
         );
-        assert!(ctx.system::<K>().value == 4);
+        assert!(ctx.get::<K>().value == 4);
     }
 
     #[test]
