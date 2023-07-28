@@ -206,12 +206,14 @@ impl EventManager {
         let start = self.in_progress.front_index();
 
         while self.working_event < self.in_progress.end_index() {
-            let node = self.in_progress.get_mut(self.working_event).unwrap_unchecked();
+            let id = self.working_event;
+            self.working_event += 1;
+            let node = self.in_progress.get_mut(id).unwrap_unchecked();
 
             if node.state != EventState::Complete {
                 if let Some(value) = Self::try_select_job(JobSelectionParams {
                     ctx,
-                    id: self.working_event,
+                    id,
                     start,
                     node,
                     main_thread,
@@ -222,8 +224,6 @@ impl EventManager {
                     return Some(value);
                 }
             }
-
-            self.working_event += 1;
         }
         
         None
@@ -241,10 +241,15 @@ impl EventManager {
             .transitive_dependencies_mut
             .get_unchecked(params.node.handler.system_id as usize);
 
-        if params.node.state == EventState::Queued
+        let available = params.node.state == EventState::Queued
             && (params.id == params.start
                 || (Self::bitmaps_exclusive(params.working_transitive_dependencies_bi, deps_mut)
-                    && Self::bitmaps_exclusive(params.working_transitive_dependencies_mut, deps)))
+                    && Self::bitmaps_exclusive(params.working_transitive_dependencies_mut, deps)));
+
+        *params.working_transitive_dependencies_bi |= deps;
+        *params.working_transitive_dependencies_mut |= deps_mut;
+
+        if available
         {
             if params.main_thread
                 || *params
@@ -262,9 +267,6 @@ impl EventManager {
                 *params.main_thread_required = (*params.main_thread_required).min(params.id);
             }
         }
-
-        *params.working_transitive_dependencies_bi |= deps;
-        *params.working_transitive_dependencies_mut |= deps_mut;
 
         None
     }
