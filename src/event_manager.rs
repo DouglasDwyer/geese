@@ -230,29 +230,23 @@ impl EventManager {
             .transitive_dependencies_mut
             .get_unchecked(params.node.handler.system_id as usize);
 
-        if params.node.state == EventState::Queued {
+        if params.node.state == EventState::Queued
+            && (params.id == params.start
+                || (Self::bitmaps_exclusive(params.working_transitive_dependencies_bi, deps_mut)
+                    && Self::bitmaps_exclusive(params.working_transitive_dependencies_mut, deps)))
+        {
             if params.main_thread
                 || *params
                     .ctx
                     .sync_systems
                     .get_unchecked(params.node.handler.system_id as usize)
             {
-                if params.id == params.start
-                    || (Self::bitmaps_exclusive(
-                        params.working_transitive_dependencies_bi,
-                        deps_mut,
-                    ) && Self::bitmaps_exclusive(
-                        params.working_transitive_dependencies_mut,
-                        deps,
-                    ))
-                {
-                    params.node.state = EventState::Processing;
-                    return Some(EventJob {
-                        event: params.node.event.as_ref().unwrap_unchecked().clone(),
-                        handler: params.node.handler,
-                        id: params.id,
-                    });
-                }
+                params.node.state = EventState::Processing;
+                return Some(EventJob {
+                    event: params.node.event.as_ref().unwrap_unchecked().clone(),
+                    handler: params.node.handler,
+                    id: params.id,
+                });
             } else {
                 *params.main_thread_required = (*params.main_thread_required).min(params.id);
             }
@@ -621,8 +615,11 @@ impl<'a> Iterator for ReceiverIter<'a> {
     }
 }
 
-/// Wraps an event manager and marks it as threadsafe.
-pub(crate) struct EventManagerWrapper(pub wasm_sync::Mutex<*mut EventManager>);
+/// Wraps an event manager mutex and condition variable, marking them as threadsafe.
+pub(crate) struct EventManagerWrapper(
+    pub wasm_sync::Mutex<*mut EventManager>,
+    pub wasm_sync::Condvar,
+);
 
 unsafe impl Send for EventManagerWrapper {}
 unsafe impl Sync for EventManagerWrapper {}

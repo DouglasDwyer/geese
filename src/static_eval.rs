@@ -8,7 +8,7 @@ macro_rules! static_eval {
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 const VALUE: $result_type = $assertion;
 
-                #[inline(never)]
+                #[inline(always)]
                 const fn calculate() -> $result_type {
                     Self::VALUE
                 }
@@ -16,7 +16,7 @@ macro_rules! static_eval {
 
             #[cfg(not(unstable))]
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
-                #[inline(never)]
+                #[inline(always)]
                 const fn calculate() -> $result_type {
                     $assertion
                 }
@@ -36,7 +36,7 @@ macro_rules! const_eval {
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 const VALUE: $result_type = $assertion;
 
-                #[inline(never)]
+                #[inline(always)]
                 const fn calculate() -> $result_type {
                     Self::VALUE
                 }

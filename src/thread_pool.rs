@@ -52,10 +52,6 @@ impl Drop for HardwareThreadPool {
 }
 
 impl GeeseThreadPool for HardwareThreadPool {
-    fn join(&self) {
-        self.inner.join();
-    }
-
     fn set_callback(&self, callback: Option<Arc<dyn Fn() + Send + Sync>>) {
         self.inner.set_callback(callback);
     }

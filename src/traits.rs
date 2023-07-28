@@ -398,13 +398,39 @@ pub(crate) const fn has_duplicate_dependencies(dependencies: &Dependencies) -> b
     false
 }
 
+/// Describes a series of events that the context should execute.
+pub trait EventQueue: Sized {
+    /// Adds a single event to the queue.
+    fn with<T: 'static + Send + Sync>(self, event: T) -> Self {
+        self.with_boxed(Box::new(event))
+    }
+
+    /// Adds a single boxed event to the queue.
+    fn with_boxed(self, event: Box<dyn Any + Send + Sync>) -> Self {
+        self.with_many_boxed(std::iter::once(event))
+    }
+
+    /// Adds a buffer of events to the queue.
+    fn with_buffer(self, events: EventBuffer) -> Self {
+        self.with_many_boxed(events.events)
+    }
+
+    /// Adds a list of events to the queue.
+    fn with_many<T: 'static + Send + Sync>(self, events: impl IntoIterator<Item = T>) -> Self {
+        self.with_many_boxed(
+            events
+                .into_iter()
+                .map(|x| Box::new(x) as Box<dyn Any + Send + Sync>),
+        )
+    }
+
+    /// Adds a list of boxed events to the queue.
+    fn with_many_boxed(self, events: impl IntoIterator<Item = Box<dyn Any + Send + Sync>>) -> Self;
+}
+
 /// Provides a backing implementation for multithreaded Geese contexts. This trait
 /// allows for defining and customizing how multiple threads complete the work of a context.
 pub trait GeeseThreadPool: 'static + Send + Sync {
-    /// Joins the threadpool by executing the specified callback (or any other background work)
-    /// on the calling thread.
-    fn join(&self);
-
     /// Sets a callback that threadpool workers should repeatedly invoke.
     fn set_callback(&self, callback: Option<Arc<dyn Fn() + Send + Sync>>);
 }

@@ -14,7 +14,25 @@ impl ConstTypeId {
     /// Determines whether this type ID matches another. This function may only be used in
     /// a `const` context on nightly.
     pub const fn eq(&self, other: &Self) -> bool {
-        unsafe { transmute::<_, u64>(self.0) == transmute::<_, u64>(other.0) }
+        unsafe {
+            Self::arrays_eq(
+                transmute::<_, &[u8; size_of::<TypeId>()]>(self),
+                transmute(other),
+            )
+        }
+    }
+
+    /// Determines whether the two given arrays are equal.
+    const fn arrays_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
+        let mut i = 0;
+        while i < N {
+            if a[i] != b[i] {
+                return false;
+            }
+
+            i += 1;
+        }
+        true
     }
 }
 
