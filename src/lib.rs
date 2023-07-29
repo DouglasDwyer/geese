@@ -440,47 +440,44 @@ impl GeeseContext {
                 }
             });
 
+            let mut lock_guard = MaybeUninit::new(mgr.0.lock().unwrap_unchecked());
             loop {
                 pool.set_callback(Some(callback.clone()));
-                loop {
-                    let mut lock_guard = mgr.0.lock().unwrap_unchecked();
-                    if let Some(event_mgr) = lock_guard.as_mut() {
-                        let guard = (*(ctx_ptr as *const RwCell<ContextInner>)).borrow();
-                        match event_mgr.next_job(&guard) {
-                            Ok(to_run) => {
-                                drop(lock_guard);
+                while let Some(event_mgr) = lock_guard.assume_init_mut().as_mut() {
+                    let guard = (*(ctx_ptr as *const RwCell<ContextInner>)).borrow();
+                    match event_mgr.next_job(&guard) {
+                        Ok(to_run) => {
+                            lock_guard.assume_init_drop();
 
-                                to_run.execute(&guard);
-                                (**mgr.0.lock().unwrap_unchecked()).complete_job(&to_run);
-                                guard.thread_pool.set_callback(Some(callback.clone()));
-                            }
-                            Err(EventJobError::Complete) => {
-                                *lock_guard = std::ptr::null_mut();
-                                guard.thread_pool.set_callback(None);
-                                break;
-                            }
-                            _ => {
-                                guard.thread_pool.set_callback(None);
-                                drop(mgr.1.wait(lock_guard));
-                            }
+                            to_run.execute(&guard);
+                            (***lock_guard.write(mgr.0.lock().unwrap_unchecked())).complete_job(&to_run);
+                            guard.thread_pool.set_callback(Some(callback.clone()));
                         }
-                    } else {
-                        break;
+                        Err(EventJobError::Complete) => {
+                            **lock_guard.assume_init_mut() = std::ptr::null_mut();
+                            guard.thread_pool.set_callback(None);
+                            break;
+                        }
+                        _ => {
+                            guard.thread_pool.set_callback(None);
+                            lock_guard.write(mgr.1.wait(lock_guard.assume_init_read()).unwrap_unchecked());
+                        }
                     }
                 }
 
                 let state = (*inner_mgr).update_state();
 
                 match state {
-                    EventManagerState::Complete() => return,
+                    EventManagerState::Complete() => break,
                     EventManagerState::CycleClogged(event) => {
                         self.run_clogged_event(event, inner_mgr);
                         (*inner_mgr).gather_external_events();
                     }
                 };
 
-                *mgr.0.lock().unwrap_unchecked() = inner_mgr;
+                **lock_guard.assume_init_mut() = inner_mgr;
             }
+            lock_guard.assume_init_drop();
         }
     }
 
@@ -614,45 +611,40 @@ impl GeeseContext {
         state: &wasm_sync::Mutex<*mut EventManager>,
         callback: &Weak<dyn Fn() + Send + Sync>,
     ) {
-        loop {
-            let mut lock_guard = state.lock().unwrap_unchecked();
-            if let Some(mgr) = lock_guard.as_mut() {
-                let guard = (*ctx).borrow();
-                match mgr.next_job(&guard) {
-                    Ok(to_run) => {
-                        drop(lock_guard);
+        let mut lock_guard = MaybeUninit::new(state.lock().unwrap_unchecked());
+        while let Some(mgr) = lock_guard.assume_init_mut().as_mut() {
+            let guard = (*ctx).borrow();
+            match mgr.next_job(&guard) {
+                Ok(to_run) => {
+                    lock_guard.assume_init_drop();
 
-                        to_run.execute(&guard);
+                    to_run.execute(&guard);
 
-                        let mut lock_guard = state.lock().unwrap_unchecked();
-                        (**lock_guard).complete_job(&to_run);
-                        guard
-                            .thread_pool
-                            .set_callback(Some(callback.upgrade().unwrap_unchecked()));
-                        on_new_work.notify_all();
-                        drop(guard);
-                        drop(lock_guard);
-                    }
-                    Err(EventJobError::Complete) => {
-                        *lock_guard = std::ptr::null_mut();
-                        guard.thread_pool.set_callback(None);
-                        on_new_work.notify_all();
-                        return;
-                    }
-                    Err(EventJobError::MainThreadRequired) => {
-                        guard.thread_pool.set_callback(None);
-                        on_new_work.notify_all();
-                        return;
-                    }
-                    _ => {
-                        guard.thread_pool.set_callback(None);
-                        return;
-                    }
+                    (***lock_guard.write(state.lock().unwrap_unchecked())).complete_job(&to_run);
+                    guard
+                        .thread_pool
+                        .set_callback(Some(callback.upgrade().unwrap_unchecked()));
+                    on_new_work.notify_all();
+                    drop(guard);
                 }
-            } else {
-                return;
+                Err(EventJobError::Complete) => {
+                    **lock_guard.assume_init_mut() = std::ptr::null_mut();
+                    guard.thread_pool.set_callback(None);
+                    on_new_work.notify_all();
+                    break;
+                }
+                Err(EventJobError::MainThreadRequired) => {
+                    guard.thread_pool.set_callback(None);
+                    on_new_work.notify_all();
+                    break;
+                }
+                _ => {
+                    guard.thread_pool.set_callback(None);
+                    break;
+                }
             }
         }
+        lock_guard.assume_init_drop();
     }
 }
 
