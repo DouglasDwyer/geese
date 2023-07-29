@@ -17,6 +17,8 @@ pub(crate) struct EventManager {
     receiver: EventReceiver,
     /// The queue of event nodes that are undergoing processing.
     in_progress: Deque<EventNode, isize>,
+    /// The number of events presently in the in-progress state.
+    processing_count: usize,
     /// The index of the next event to check in the queue for processing.
     working_event: isize,
     /// A rolling list of systems that are dependents or dependencies of in-progress event nodes.
@@ -28,6 +30,8 @@ pub(crate) struct EventManager {
 impl EventManager {
     /// The default amount of space to allocate for objects in an event queue.
     const DEFAULT_EVENT_BUFFER_SIZE: usize = 4;
+    /// The maximum allowed ratio of events in the queue to processing events.
+    const MAX_TOTAL_PROCESSING_RATIO: usize = 8;
 
     /// Creates a new, empty event manager and an associated sender for raising events.
     #[inline(always)]
@@ -41,6 +45,7 @@ impl EventManager {
                 event_lists: SmallVec::new(),
                 receiver,
                 in_progress: Deque::new(),
+                processing_count: 0,
                 working_event: 0,
                 working_transitive_dependencies_bi: BitVec::new(),
                 working_transitive_dependencies_mut: BitVec::new(),
@@ -135,6 +140,7 @@ impl EventManager {
                     .in_progress
                     .get_mut(self.blocked_main_event)
                     .unwrap_unchecked();
+                self.processing_count += 1;
                 node.state = EventState::Processing;
                 return Ok(EventJob {
                     event: node.event.as_ref().unwrap_unchecked().clone(),
@@ -195,6 +201,7 @@ impl EventManager {
             value.emitted_events.extend(emitted);
         }
 
+        self.processing_count -= 1;
         self.working_event = self.in_progress.front_index();
         self.working_transitive_dependencies_bi.fill(false);
         self.working_transitive_dependencies_mut.fill(false);
@@ -217,15 +224,18 @@ impl EventManager {
                     start,
                     node,
                     main_thread,
-                    working_transitive_dependencies_bi: &mut self.working_transitive_dependencies_bi,
-                    working_transitive_dependencies_mut: &mut self.working_transitive_dependencies_mut,
+                    working_transitive_dependencies_bi: &mut self
+                        .working_transitive_dependencies_bi,
+                    working_transitive_dependencies_mut: &mut self
+                        .working_transitive_dependencies_mut,
+                    processing_count: &mut self.processing_count,
                     main_thread_required: &mut self.blocked_main_event,
                 }) {
                     return Some(value);
                 }
             }
         }
-        
+
         None
     }
 
@@ -249,8 +259,7 @@ impl EventManager {
         *params.working_transitive_dependencies_bi |= deps;
         *params.working_transitive_dependencies_mut |= deps_mut;
 
-        if available
-        {
+        if available {
             if params.main_thread
                 || *params
                     .ctx
@@ -258,6 +267,7 @@ impl EventManager {
                     .get_unchecked(params.node.handler.system_id as usize)
             {
                 params.node.state = EventState::Processing;
+                *params.processing_count += 1;
                 return Some(EventJob {
                     event: params.node.event.as_ref().unwrap_unchecked().clone(),
                     handler: params.node.handler,
@@ -275,45 +285,54 @@ impl EventManager {
     #[inline(always)]
     unsafe fn queue_new_jobs(&mut self, ctx: &ContextInner, main_thread: bool) -> Option<EventJob> {
         loop {
-            while let Some(event) = self.event_lists.last_mut().unwrap_unchecked().pop_front() {
-                if Self::clogging_event(&*event) {
-                    self.clogged_event = Some(event);
-                    return None;
-                } else if event.is::<notify::Delayed>() {
-                    if self.in_progress.is_empty() {
-                        self.event_lists
-                            .last_mut()
-                            .unwrap_unchecked()
-                            .push_back(event.downcast::<notify::Delayed>().unwrap_unchecked().0);
+            loop {
+                if self.processing_count * Self::MAX_TOTAL_PROCESSING_RATIO < self.in_progress.len()
+                {
+                    break;
+                }
+
+                if let Some(event) = self.event_lists.last_mut().unwrap_unchecked().pop_front() {
+                    if Self::clogging_event(&*event) {
+                        self.clogged_event = Some(event);
+                        return None;
+                    } else if event.is::<notify::Delayed>() {
+                        if self.in_progress.is_empty() {
+                            self.event_lists.last_mut().unwrap_unchecked().push_back(
+                                event.downcast::<notify::Delayed>().unwrap_unchecked().0,
+                            );
+                        } else {
+                            self.in_progress.push_back(EventNode::completed(event));
+                        }
                     } else {
-                        self.in_progress.push_back(EventNode::completed(event));
-                    }
-                } else {
-                    let shared = Arc::<dyn Any + Send + Sync>::from(event);
-                    let start = self.in_progress.front_index();
-                    let end = start + self.in_progress.len() as isize;
+                        let shared = Arc::<dyn Any + Send + Sync>::from(event);
+                        let start = self.in_progress.front_index();
+                        let end = start + self.in_progress.len() as isize;
 
-                    for handle in ctx.event_handlers.handlers((*shared).type_id()) {
-                        self.in_progress
-                            .push_back(EventNode::new(shared.clone(), *handle));
-                    }
+                        for handle in ctx.event_handlers.handlers((*shared).type_id()) {
+                            self.in_progress
+                                .push_back(EventNode::new(shared.clone(), *handle));
+                        }
 
-                    for id in end..self.in_progress.end_index() {
-                        if let Some(job) = Self::try_select_job(JobSelectionParams {
-                            ctx,
-                            id,
-                            start,
-                            node: self.in_progress.get_mut(id).unwrap_unchecked(),
-                            main_thread,
-                            working_transitive_dependencies_bi: &mut self
-                                .working_transitive_dependencies_bi,
-                            working_transitive_dependencies_mut: &mut self
-                                .working_transitive_dependencies_mut,
-                            main_thread_required: &mut self.blocked_main_event,
-                        }) {
-                            return Some(job);
+                        for id in end..self.in_progress.end_index() {
+                            if let Some(job) = Self::try_select_job(JobSelectionParams {
+                                ctx,
+                                id,
+                                start,
+                                node: self.in_progress.get_mut(id).unwrap_unchecked(),
+                                main_thread,
+                                working_transitive_dependencies_bi: &mut self
+                                    .working_transitive_dependencies_bi,
+                                working_transitive_dependencies_mut: &mut self
+                                    .working_transitive_dependencies_mut,
+                                processing_count: &mut self.processing_count,
+                                main_thread_required: &mut self.blocked_main_event,
+                            }) {
+                                return Some(job);
+                            }
                         }
                     }
+                } else {
+                    break;
                 }
             }
 
@@ -394,6 +413,8 @@ struct JobSelectionParams<'a> {
     working_transitive_dependencies_bi: &'a mut BitVec,
     /// The set of rolling mutable transitive dependencies for all previous nodes.
     working_transitive_dependencies_mut: &'a mut BitVec,
+    /// The number of scheduled events in the in-progress state.
+    processing_count: &'a mut usize,
     /// The ID of the earliest job that requires the main thread.
     main_thread_required: &'a mut isize,
 }
