@@ -58,10 +58,9 @@ impl GeeseSystem for B {
 
 let ab = Arc::new(AtomicBool::new(false));
 let mut ctx = GeeseContext::default();
-ctx.flush(EventQueue::default()
+ctx.flush()
     .with(notify::add_system::<B>())
-    .with(ab.clone())
-);
+    .with(ab.clone());
 assert!(ab.load(Ordering::Relaxed));
 ```
 
