@@ -1,6 +1,6 @@
-use const_list::*;
 use crate::const_type_id::*;
 use crate::*;
+use const_list::*;
 use private::*;
 use std::any::*;
 use std::mem::*;
@@ -217,7 +217,9 @@ impl<S: GeeseSystem> Clone for EventHandlers<S> {
 
 impl<S: GeeseSystem> std::fmt::Debug for EventHandlers<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EventHandlers").field("inner", &self.inner).finish()
+        f.debug_struct("EventHandlers")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -238,12 +240,10 @@ pub struct EventHandler<S: GeeseSystem> {
 impl<S: GeeseSystem> EventHandler<S> {
     /// Creates a new event handler to wrap the given function pointer.
     #[inline(always)]
-    pub const fn new<Q: MutableRef<S>, T: 'static + Send + Sync>(
-        handler: fn(Q, &T),
-    ) -> Self {
+    pub const fn new<Q: MutableRef<S>, T: 'static + Send + Sync>(handler: fn(Q, &T)) -> Self {
         Self {
             raw: EventHandlerRaw::new(handler),
-            data: PhantomData
+            data: PhantomData,
         }
     }
 }
@@ -258,7 +258,9 @@ impl<S: GeeseSystem> Clone for EventHandler<S> {
 
 impl<S: GeeseSystem> std::fmt::Debug for EventHandler<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EventHandler").field("raw", &self.raw).finish()
+        f.debug_struct("EventHandler")
+            .field("raw", &self.raw)
+            .finish()
     }
 }
 

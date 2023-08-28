@@ -110,7 +110,6 @@ mod thread_pool;
 /// Defines the core traits used to create Geese systems.
 mod traits;
 
-use const_list::*;
 use crate::event_manager::*;
 use crate::rw_cell::*;
 use crate::static_eval::*;
@@ -119,6 +118,7 @@ pub use crate::thread_pool::*;
 pub use crate::traits::*;
 use bitvec::access::*;
 use bitvec::prelude::*;
+use const_list::*;
 use fxhash::*;
 use smallvec::*;
 use std::any::*;
@@ -447,7 +447,8 @@ impl GeeseContext {
                             lock_guard.assume_init_drop();
 
                             to_run.execute(&guard);
-                            (***lock_guard.write(mgr.0.lock().unwrap_unchecked())).complete_job(&to_run);
+                            (***lock_guard.write(mgr.0.lock().unwrap_unchecked()))
+                                .complete_job(&to_run);
                             guard.thread_pool.set_callback(Some(callback.clone()));
                         }
                         Err(EventJobError::Complete) => {
@@ -457,7 +458,9 @@ impl GeeseContext {
                         }
                         _ => {
                             guard.thread_pool.set_callback(None);
-                            lock_guard.write(mgr.1.wait(lock_guard.assume_init_read()).unwrap_unchecked());
+                            lock_guard.write(
+                                mgr.1.wait(lock_guard.assume_init_read()).unwrap_unchecked(),
+                            );
                         }
                     }
                 }
