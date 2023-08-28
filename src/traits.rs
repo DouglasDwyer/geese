@@ -1,4 +1,4 @@
-use crate::const_list::*;
+use const_list::*;
 use crate::const_type_id::*;
 use crate::*;
 use private::*;
@@ -56,7 +56,7 @@ pub trait GeeseSystem: 'static + Sized {
 #[derive(Copy, Clone, Debug)]
 pub struct Dependencies {
     /// The inner list of dependencies.
-    inner: ConstList<'static, DependencyHolder>,
+    inner: ConstList<'static, Dependency>,
 }
 
 impl Dependencies {
@@ -70,15 +70,21 @@ impl Dependencies {
 
     /// Adds the given type to the dependency list, returning the modified list.
     #[inline(always)]
-    pub const fn with<S: Dependency>(&'static self) -> Self {
+    pub const fn with<S: DependencyRef>(&'static self) -> Self {
+        self.with_dependency(Dependency::new::<S>())
+    }
+
+    /// Adds the given type to the dependency list, returning the modified list.
+    #[inline(always)]
+    pub const fn with_dependency(&'static self, dependency: Dependency) -> Self {
         Self {
-            inner: self.inner.push(DependencyHolder::new::<S>()),
+            inner: self.inner.push(dependency),
         }
     }
 
     /// Gets a reference to the inner list of dependency holders.
     #[inline(always)]
-    pub(crate) const fn as_inner(&self) -> &ConstList<'static, DependencyHolder> {
+    pub(crate) const fn as_inner(&self) -> &ConstList<'static, Dependency> {
         &self.inner
     }
 
@@ -107,7 +113,7 @@ pub const fn dependencies() -> Dependencies {
 
 /// Describes a system dependency.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct DependencyHolder {
+pub struct Dependency {
     /// A function which retrieves a descriptor at runtime.
     descriptor_getter: fn() -> Box<dyn SystemDescriptor>,
     /// The list of this dependency's subdependencies.
@@ -118,10 +124,10 @@ pub(crate) struct DependencyHolder {
     type_id: ConstTypeId,
 }
 
-impl DependencyHolder {
-    /// Creates a holder for the provided dependency.
+impl Dependency {
+    /// Creates a new dependency for the provided type.
     #[inline(always)]
-    pub const fn new<S: Dependency>() -> Self {
+    pub const fn new<S: DependencyRef>() -> Self {
         Self {
             descriptor_getter: Self::get_descriptor::<S::System>,
             dependencies: &S::System::DEPENDENCIES,
@@ -132,19 +138,19 @@ impl DependencyHolder {
 
     /// Gets the type ID of this dependency.
     #[inline(always)]
-    pub const fn dependency_id(&self) -> ConstTypeId {
+    pub(crate) const fn dependency_id(&self) -> ConstTypeId {
         self.type_id
     }
 
     /// Determines whether this dependency may be mutably borrowed.
     #[inline(always)]
-    pub const fn mutable(&self) -> bool {
+    pub(crate) const fn mutable(&self) -> bool {
         self.mutable
     }
 
     /// Gets a descriptor for use with system instantiation.
     #[inline(always)]
-    pub fn descriptor(&self) -> Box<dyn SystemDescriptor> {
+    pub(crate) fn descriptor(&self) -> Box<dyn SystemDescriptor> {
         (self.descriptor_getter)()
     }
 
@@ -159,7 +165,7 @@ impl DependencyHolder {
 #[allow(unused_variables)]
 pub struct EventHandlers<S: GeeseSystem> {
     /// The inner list of event handlers.
-    inner: ConstList<'static, EventHandler>,
+    inner: ConstList<'static, EventHandlerRaw>,
     /// Phantom data to mark the system as used.
     data: PhantomData<fn(S)>,
 }
@@ -181,14 +187,22 @@ impl<S: GeeseSystem> EventHandlers<S> {
         handler: fn(Q, &T),
     ) -> Self {
         Self {
-            inner: self.inner.push(EventHandler::new(handler)),
+            inner: self.inner.push(EventHandlerRaw::new(handler)),
+            data: PhantomData,
+        }
+    }
+
+    /// Adds the given wrapped event handler to the list, returning the modified list.
+    pub const fn with_handler(&'static self, handler: EventHandler<S>) -> Self {
+        Self {
+            inner: self.inner.push(handler.raw),
             data: PhantomData,
         }
     }
 
     /// Gets a reference to the inner list of event handlers.
     #[inline(always)]
-    fn as_inner(&self) -> &ConstList<'_, EventHandler> {
+    fn as_inner(&self) -> &ConstList<'_, EventHandlerRaw> {
         &self.inner
     }
 }
@@ -213,16 +227,51 @@ pub const fn event_handlers<S: GeeseSystem>() -> EventHandlers<S> {
     EventHandlers::new()
 }
 
+/// Wraps an event handler function for a system.
+pub struct EventHandler<S: GeeseSystem> {
+    /// The inner event handler.
+    raw: EventHandlerRaw,
+    /// Phantom data to mark the system as used.
+    data: PhantomData<fn(S)>,
+}
+
+impl<S: GeeseSystem> EventHandler<S> {
+    /// Creates a new event handler to wrap the given function pointer.
+    #[inline(always)]
+    pub const fn new<Q: MutableRef<S>, T: 'static + Send + Sync>(
+        handler: fn(Q, &T),
+    ) -> Self {
+        Self {
+            raw: EventHandlerRaw::new(handler),
+            data: PhantomData
+        }
+    }
+}
+
+impl<S: GeeseSystem> Copy for EventHandler<S> {}
+
+impl<S: GeeseSystem> Clone for EventHandler<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: GeeseSystem> std::fmt::Debug for EventHandler<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventHandler").field("raw", &self.raw).finish()
+    }
+}
+
 /// Describes an event handler for a system.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct EventHandler {
+pub(crate) struct EventHandlerRaw {
     /// A function that retrieves the type ID of the event.
     event_id: fn() -> TypeId,
     /// A reference to the event handler function.
     handler: EventInvoker,
 }
 
-impl EventHandler {
+impl EventHandlerRaw {
     /// Creates a new event handler to wrap the given function pointer.
     #[inline(always)]
     pub const fn new<S: GeeseSystem, Q: MutableRef<S>, T: 'static + Send + Sync>(
@@ -323,7 +372,7 @@ pub(super) trait SystemDescriptor: 'static + Send + Sync {
     fn dependency_len(&self) -> usize;
 
     /// The event handlers associated with this system.
-    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler>;
+    fn event_handlers(&self) -> &'static ConstList<'static, EventHandlerRaw>;
 
     /// Whether this type may be safely sent across threads.
     fn is_send(&self) -> bool;
@@ -358,7 +407,7 @@ impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
         const_eval!(S::DEPENDENCIES.as_inner().len(), usize, S)
     }
 
-    fn event_handlers(&self) -> &'static ConstList<'static, EventHandler> {
+    fn event_handlers(&self) -> &'static ConstList<'static, EventHandlerRaw> {
         S::EVENT_HANDLERS.as_inner()
     }
 
@@ -453,7 +502,7 @@ mod private {
     use super::*;
 
     /// Describes one system's dependency on another.
-    pub trait Dependency {
+    pub trait DependencyRef {
         /// The underlying type of the dependency.
         type System: GeeseSystem;
 
@@ -461,13 +510,13 @@ mod private {
         const MUTABLE: bool;
     }
 
-    impl<S: GeeseSystem> Dependency for S {
+    impl<S: GeeseSystem> DependencyRef for S {
         type System = S;
 
         const MUTABLE: bool = false;
     }
 
-    impl<S: GeeseSystem> Dependency for Mut<S> {
+    impl<S: GeeseSystem> DependencyRef for Mut<S> {
         type System = S;
 
         const MUTABLE: bool = true;

@@ -11,6 +11,7 @@ Dead-simple game event system for Rust.
 
 [dependencies]
 bitvec = "1.0.1"
+const_list = "0.1.0"
 fxhash = "0.2.1"
 smallvec = "1.11.0"
 topological-sort = "0.2.2"

@@ -87,9 +87,6 @@
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
 
-/// Provides the ability to create lists at compile time.
-mod const_list;
-
 /// Provides the ability to generate and compare type IDs in a `const` context.
 #[cfg_attr(unstable, path = "const_type_id/compiled.rs")]
 #[cfg_attr(not(unstable), path = "const_type_id/runtime.rs")]
@@ -113,7 +110,7 @@ mod thread_pool;
 /// Defines the core traits used to create Geese systems.
 mod traits;
 
-use crate::const_list::*;
+use const_list::*;
 use crate::event_manager::*;
 use crate::rw_cell::*;
 use crate::static_eval::*;
@@ -1581,7 +1578,7 @@ impl EventMap {
     /// Adds all of the event handlers in the given list to this map, associating them with
     /// the provided system ID.
     #[inline(always)]
-    pub fn add_handlers(&mut self, system_id: u16, handlers: &ConstList<'_, EventHandler>) {
+    pub fn add_handlers(&mut self, system_id: u16, handlers: &ConstList<'_, EventHandlerRaw>) {
         for entry in handlers {
             self.handlers
                 .entry(entry.event_id())
