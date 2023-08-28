@@ -157,7 +157,6 @@ impl DependencyHolder {
 
 /// Denotes a list of system methods that respond to events.
 #[allow(unused_variables)]
-#[derive(Copy, Clone, Debug)]
 pub struct EventHandlers<S: GeeseSystem> {
     /// The inner list of event handlers.
     inner: ConstList<'static, EventHandler>,
@@ -191,6 +190,20 @@ impl<S: GeeseSystem> EventHandlers<S> {
     #[inline(always)]
     fn as_inner(&self) -> &ConstList<'_, EventHandler> {
         &self.inner
+    }
+}
+
+impl<S: GeeseSystem> Copy for EventHandlers<S> {}
+
+impl<S: GeeseSystem> Clone for EventHandlers<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: GeeseSystem> std::fmt::Debug for EventHandlers<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventHandlers").field("inner", &self.inner).finish()
     }
 }
 
