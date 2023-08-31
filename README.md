@@ -64,6 +64,8 @@ ctx.flush()
 assert!(ab.load(Ordering::Relaxed));
 ```
 
+A working game of Pong using `geese` can be found in [the examples folder](/examples/).
+
 ### Event processing
 
 The following invariants are always upheld during event processing, making it easy to reason about order of execution:
