@@ -1,23 +1,32 @@
 use geese::*;
 use macroquad::prelude::*;
 
-
 pub struct GameGraphics {
     ctx: GeeseContextHandle<Self>,
     draw_rect: Rect,
-    winning_player: Option<u32>
+    winning_player: Option<u32>,
 }
 
 impl GameGraphics {
     fn update_draw_rect(&mut self) {
         let side_length = screen_height().min(screen_width());
-        self.draw_rect = Rect::new(0.5 * (screen_width() - side_length), 0.5 * (screen_height() - side_length), side_length, side_length);
+        self.draw_rect = Rect::new(
+            0.5 * (screen_width() - side_length),
+            0.5 * (screen_height() - side_length),
+            side_length,
+            side_length,
+        );
     }
 
     fn relative_to_absolute(&self, rect: &Rect) -> Rect {
-        Rect::new(self.draw_rect.w * rect.x + self.draw_rect.x, self.draw_rect.h * rect.y + self.draw_rect.y, self.draw_rect.w * rect.w, self.draw_rect.h * rect.h)
+        Rect::new(
+            self.draw_rect.w * rect.x + self.draw_rect.x,
+            self.draw_rect.h * rect.y + self.draw_rect.y,
+            self.draw_rect.w * rect.w,
+            self.draw_rect.h * rect.h,
+        )
     }
-    
+
     fn draw_rect(&self, rect: &Rect, color: Color) {
         let absolute = self.relative_to_absolute(rect);
         draw_rectangle(absolute.x, absolute.y, absolute.w, absolute.h, color);
@@ -25,7 +34,7 @@ impl GameGraphics {
 
     fn draw_world(&self) {
         let world = self.ctx.get::<Store<GameWorld>>();
-        
+
         self.draw_rect(&world.left_paddle_rect(), WHITE);
         self.draw_rect(&world.right_paddle_rect(), WHITE);
 
@@ -43,34 +52,48 @@ impl GameGraphics {
 
         if let Some(winner) = self.winning_player {
             clear_background(VIOLET);
-            draw_text(&format!("Player {winner} wins!"), self.draw_rect.center().x, self.draw_rect.center().y, 30.0, WHITE);
-        }
-        else {
+            draw_text(
+                &format!("Player {winner} wins!"),
+                self.draw_rect.center().x,
+                self.draw_rect.center().y,
+                30.0,
+                WHITE,
+            );
+        } else {
             clear_background(DARKBLUE);
-            draw_rectangle_lines(self.draw_rect.x, self.draw_rect.y, self.draw_rect.w, self.draw_rect.h, 1.0, WHITE);
+            draw_rectangle_lines(
+                self.draw_rect.x,
+                self.draw_rect.y,
+                self.draw_rect.w,
+                self.draw_rect.h,
+                1.0,
+                WHITE,
+            );
             self.draw_world();
         }
     }
 }
 
 impl GeeseSystem for GameGraphics {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<Store<GameWorld>>();
+    const DEPENDENCIES: Dependencies = dependencies().with::<Store<GameWorld>>();
 
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
-        .with(Self::draw_game)
-        .with(Self::end_game);
+    const EVENT_HANDLERS: EventHandlers<Self> =
+        event_handlers().with(Self::draw_game).with(Self::end_game);
 
     fn new(ctx: GeeseContextHandle<Self>) -> Self {
         let draw_rect = Rect::default();
         let winning_player = None;
 
-        Self { ctx, draw_rect, winning_player }
+        Self {
+            ctx,
+            draw_rect,
+            winning_player,
+        }
     }
 }
 
 pub struct GameInput {
-    ctx: GeeseContextHandle<Self>
+    ctx: GeeseContextHandle<Self>,
 }
 
 impl GameInput {
@@ -101,11 +124,9 @@ impl GameInput {
 }
 
 impl GeeseSystem for GameInput {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<Mut<Store<GameWorld>>>();
+    const DEPENDENCIES: Dependencies = dependencies().with::<Mut<Store<GameWorld>>>();
 
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
-        .with(Self::move_paddles);
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::move_paddles);
 
     fn new(ctx: GeeseContextHandle<Self>) -> Self {
         Self { ctx }
@@ -113,7 +134,7 @@ impl GeeseSystem for GameInput {
 }
 
 pub struct GamePhysics {
-    ctx: GeeseContextHandle<Self>
+    ctx: GeeseContextHandle<Self>,
 }
 
 impl GamePhysics {
@@ -124,14 +145,14 @@ impl GamePhysics {
 
         let collision = ball_rect.overlaps(&if world.ball_velocity.x < 0.0 {
             world.left_paddle_rect()
-        }
-        else {
+        } else {
             world.right_paddle_rect()
         });
 
         if collision {
             world.ball_velocity.x *= -1.0;
-            world.ball_velocity.y = rand::gen_range(-world.max_ball_velocity.y, world.max_ball_velocity.y);
+            world.ball_velocity.y =
+                rand::gen_range(-world.max_ball_velocity.y, world.max_ball_velocity.y);
         }
     }
 
@@ -142,22 +163,20 @@ impl GamePhysics {
 
         let vertical_collision = if world.ball_velocity.y < 0.0 {
             ball_rect.bottom() <= 0.0
-        }
-        else {
+        } else {
             ball_rect.top() >= 1.0
         };
 
         if vertical_collision {
             world.ball_velocity.y *= -1.0;
         }
-        
+
         if world.ball_velocity.x < 0.0 {
             if ball_rect.left() <= 0.0 {
                 drop(world);
                 self.ctx.raise_event(on::GameOver { winning_player: 2 });
             }
-        }
-        else {
+        } else {
             if ball_rect.right() >= 1.0 {
                 drop(world);
                 self.ctx.raise_event(on::GameOver { winning_player: 1 });
@@ -179,11 +198,9 @@ impl GamePhysics {
 }
 
 impl GeeseSystem for GamePhysics {
-    const DEPENDENCIES: Dependencies = dependencies()
-        .with::<Mut<Store<GameWorld>>>();
+    const DEPENDENCIES: Dependencies = dependencies().with::<Mut<Store<GameWorld>>>();
 
-    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers()
-        .with(Self::move_ball);
+    const EVENT_HANDLERS: EventHandlers<Self> = event_handlers().with(Self::move_ball);
 
     fn new(ctx: GeeseContextHandle<Self>) -> Self {
         Self { ctx }
@@ -200,20 +217,35 @@ pub struct GameWorld {
     pub ball_position: Vec2,
     pub ball_velocity: Vec2,
     pub ball_size: f32,
-    pub max_ball_velocity: Vec2
+    pub max_ball_velocity: Vec2,
 }
 
 impl GameWorld {
     pub fn left_paddle_rect(&self) -> Rect {
-        Rect::new(0.0, self.left_paddle_pos - 0.5 * self.paddle_height, self.paddle_width, self.paddle_height)
+        Rect::new(
+            0.0,
+            self.left_paddle_pos - 0.5 * self.paddle_height,
+            self.paddle_width,
+            self.paddle_height,
+        )
     }
 
     pub fn right_paddle_rect(&self) -> Rect {
-        Rect::new(1.0 - self.paddle_width, self.right_paddle_pos - 0.5 * self.paddle_height, self.paddle_width, self.paddle_height)
+        Rect::new(
+            1.0 - self.paddle_width,
+            self.right_paddle_pos - 0.5 * self.paddle_height,
+            self.paddle_width,
+            self.paddle_height,
+        )
     }
 
     pub fn ball_rect(&self) -> Rect {
-        Rect::new(self.ball_position.x - 0.5 * self.ball_size, self.ball_position.y - 0.5 * self.ball_size, self.ball_size, self.ball_size)
+        Rect::new(
+            self.ball_position.x - 0.5 * self.ball_size,
+            self.ball_position.y - 0.5 * self.ball_size,
+            self.ball_size,
+            self.ball_size,
+        )
     }
 }
 
@@ -228,7 +260,7 @@ impl Default for GameWorld {
             ball_position: vec2(0.5, 0.5),
             ball_velocity: vec2(0.5, 0.0),
             ball_size: 0.025,
-            max_ball_velocity: vec2(0.7, 1.0)
+            max_ball_velocity: vec2(0.7, 1.0),
         }
     }
 }
@@ -248,11 +280,11 @@ impl GeeseSystem for PongGame {
 
 mod on {
     pub struct NewFrame {
-        pub delta_time: f32
+        pub delta_time: f32,
     }
 
     pub struct GameOver {
-        pub winning_player: u32
+        pub winning_player: u32,
     }
 }
 
@@ -262,7 +294,9 @@ async fn main() {
     ctx.flush().with(geese::notify::add_system::<PongGame>());
 
     loop {
-        ctx.flush().with(on::NewFrame { delta_time: get_frame_time() });
+        ctx.flush().with(on::NewFrame {
+            delta_time: get_frame_time(),
+        });
         next_frame().await;
     }
 }
