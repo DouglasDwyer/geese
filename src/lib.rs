@@ -1643,7 +1643,7 @@ impl EventQueue for EventBuffer {
 }
 
 /// Denotes an event sequence that will be flushed through a context upon drop.
-pub struct ContextEventQueue<'a> {
+struct ContextEventQueue<'a> {
     /// The context to which events should be flushed.
     ctx: &'a mut GeeseContext,
     /// The internal queue of events.
