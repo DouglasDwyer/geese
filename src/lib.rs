@@ -121,12 +121,12 @@ pub use crate::traits::*;
 use bitvec::access::*;
 use bitvec::prelude::*;
 use const_list::*;
-use fxhash::*;
 use smallvec::*;
 use std::any::*;
 use std::cell::*;
 use std::collections::hash_map::*;
 use std::hash::*;
+use std::hint::*;
 use std::marker::*;
 use std::mem::*;
 use std::ops::*;
@@ -134,6 +134,9 @@ use std::pin::*;
 use std::sync::atomic::*;
 use std::sync::*;
 use topological_sort::*;
+
+/// Provides an efficient mapping from `TypeId`s to values.
+type TypeMap<V> = HashMap<TypeId, V, TypeIdBuilderHasher>;
 
 /// Represents a system-specific handle to a Geese context.
 #[allow(unused_variables)]
@@ -441,6 +444,7 @@ impl GeeseContext {
 
             let mut lock_guard = MaybeUninit::new(mgr.0.lock().unwrap_unchecked());
             loop {
+                let mut notify_new_work = false;
                 pool.set_callback(Some(callback.clone()));
                 while let Some(event_mgr) = lock_guard.assume_init_mut().as_mut() {
                     let guard = (*(ctx_ptr as *const RwCell<ContextInner>)).borrow();
@@ -448,10 +452,14 @@ impl GeeseContext {
                         Ok(to_run) => {
                             lock_guard.assume_init_drop();
 
+                            if take(&mut notify_new_work) {
+                                guard.thread_pool.set_callback(Some(callback.clone()));
+                            }
+
                             to_run.execute(&guard);
                             (***lock_guard.write(mgr.0.lock().unwrap_unchecked()))
                                 .complete_job(&to_run);
-                            guard.thread_pool.set_callback(Some(callback.clone()));
+                            notify_new_work = true;
                         }
                         Err(EventJobError::Complete) => {
                             **lock_guard.assume_init_mut() = std::ptr::null_mut();
@@ -459,6 +467,7 @@ impl GeeseContext {
                             break;
                         }
                         _ => {
+                            notify_new_work = false;
                             guard.thread_pool.set_callback(None);
                             lock_guard.write(
                                 mgr.1.wait(lock_guard.assume_init_read()).unwrap_unchecked(),
@@ -558,7 +567,7 @@ impl GeeseContext {
     unsafe fn drop_systems(
         &self,
         systems: &BitVec,
-        initializers: &mut FxHashMap<TypeId, SystemInitializer>,
+        initializers: &mut TypeMap<SystemInitializer>,
     ) {
         let inner = self.0.borrow();
         for system in systems.iter_zeros().rev() {
@@ -614,20 +623,24 @@ impl GeeseContext {
         callback: &Weak<dyn Fn() + Send + Sync>,
     ) {
         let mut lock_guard = MaybeUninit::new(state.lock().unwrap_unchecked());
+        let mut notify_new_work = false;
         while let Some(mgr) = lock_guard.assume_init_mut().as_mut() {
             let guard = (*ctx).borrow();
             match mgr.next_job(&guard) {
                 Ok(to_run) => {
                     lock_guard.assume_init_drop();
+                    
+                    if take(&mut notify_new_work) {
+                        guard
+                            .thread_pool
+                            .set_callback(Some(callback.upgrade().unwrap_unchecked()));
+                        on_new_work.notify_all();
+                    }
 
                     to_run.execute(&guard);
 
                     (***lock_guard.write(state.lock().unwrap_unchecked())).complete_job(&to_run);
-                    guard
-                        .thread_pool
-                        .set_callback(Some(callback.upgrade().unwrap_unchecked()));
-                    on_new_work.notify_all();
-                    drop(guard);
+                    notify_new_work = true;
                 }
                 Err(EventJobError::Complete) => {
                     **lock_guard.assume_init_mut() = std::ptr::null_mut();
@@ -688,7 +701,7 @@ struct ContextInner {
     /// The set of systems which (including all dependencies) implement the `Sync` trait.
     sync_systems: BitVec,
     /// The set of currently-loaded system initializers.
-    system_initializers: FxHashMap<TypeId, SystemInitializer>,
+    system_initializers: TypeMap<SystemInitializer>,
     /// The set of loaded systems.
     systems: Vec<SystemHolder>,
     /// The threadpool with which to asynchronously coordinate context work.
@@ -716,7 +729,7 @@ impl ContextInner {
             event_sender,
             owning_thread: std::thread::current().id(),
             sync_systems: BitVec::default(),
-            system_initializers: FxHashMap::default(),
+            system_initializers: TypeMap::default(),
             systems: Vec::default(),
             thread_pool: Arc::new(pool),
             transitive_dependencies: SystemFlagsList::default(),
@@ -790,7 +803,7 @@ impl ContextInner {
     #[inline(always)]
     pub fn instantiate_added_systems<'a>(
         &mut self,
-        initializers: &'a FxHashMap<TypeId, SystemInitializer>,
+        initializers: &'a TypeMap<SystemInitializer>,
         ctx: *const RwCell<ContextInner>,
     ) -> SmallVec<[&'a SystemInitializer; Self::DEFAULT_SYSTEM_PROCESSING_SIZE]> {
         unsafe {
@@ -1110,7 +1123,7 @@ impl ContextInner {
     /// their dependents.
     #[inline(always)]
     fn topological_sort_systems(
-        descriptors: &FxHashMap<TypeId, SystemInitializer>,
+        descriptors: &TypeMap<SystemInitializer>,
     ) -> Vec<SystemStateRef<'_>> {
         unsafe {
             let mut sort: TopologicalSort<SystemStateRef<'_>> = TopologicalSort::new();
@@ -1140,8 +1153,8 @@ impl ContextInner {
     /// This function must not be called while the system handle is simultaneously being used elsewhere.
     #[inline(always)]
     unsafe fn update_holder_data(
-        data: &mut SystemHolder,
-        descriptors: &FxHashMap<TypeId, SystemInitializer>,
+        data: &SystemHolder,
+        descriptors: &TypeMap<SystemInitializer>,
         state: &SystemInitializer,
     ) {
         data.handle.set_id(state.id());
@@ -1337,6 +1350,7 @@ impl SystemHolder {
     /// # Safety
     ///
     /// The initial contents of the context handle must not affect the program's execution in any fashion.
+    #[allow(clippy::arc_with_non_send_sync)]
     #[inline(always)]
     pub unsafe fn new(
         system_id: TypeId,
@@ -1573,7 +1587,7 @@ impl<'a, T: ?Sized> DerefMut for SystemRefMut<'a, T> {
 #[derive(Clone, Debug, Default)]
 struct EventMap {
     /// The inner mapping from type IDs to event handlers.
-    handlers: FxHashMap<TypeId, SmallVec<[EventHandlerEntry; Self::DEFAULT_HANDLER_BUFFER_SIZE]>>,
+    handlers: TypeMap<SmallVec<[EventHandlerEntry; Self::DEFAULT_HANDLER_BUFFER_SIZE]>>,
 }
 
 impl EventMap {
@@ -1666,6 +1680,49 @@ impl<'a> Drop for ContextEventQueue<'a> {
     }
 }
 
+/// Allows for hashing type IDs by directly taking their representation as a `u64`.
+#[derive(Copy, Clone, Debug, Default)]
+struct TypeIdBuilderHasher;
+
+impl BuildHasher for TypeIdBuilderHasher {
+    type Hasher = TypeIdHasher;
+
+    #[inline(always)]
+    fn build_hasher(&self) -> Self::Hasher {
+        TypeIdHasher(MaybeUninit::uninit())
+    }
+}
+
+/// Hashes a type ID by directly taking its representation as a `u64`.
+/// 
+/// # Safety
+/// 
+/// For this hasher to be sound, `write_u64` must be called on it a single time,
+/// followed by `finish`.
+#[repr(transparent)]
+struct TypeIdHasher(MaybeUninit<u64>);
+
+impl Hasher for TypeIdHasher {
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        unsafe {
+            self.0.assume_init_read()
+        }
+    }
+
+    #[inline(always)]
+    fn write(&mut self, _: &[u8]) {
+        unsafe {
+            unreachable_unchecked();
+        }
+    }
+
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = MaybeUninit::new(i);
+    }
+}
+
 /// Provides events to which the Geese context responds.
 pub mod notify {
     use super::*;
@@ -1731,7 +1788,7 @@ pub mod notify {
             mut self,
             events: impl IntoIterator<Item = Box<dyn Any + Send + Sync>>,
         ) -> Self {
-            self.0.events.extend(events.into_iter());
+            self.0.events.extend(events);
             self
         }
     }

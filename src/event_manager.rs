@@ -136,7 +136,7 @@ impl EventManager {
 
         if self.blocked_main_event < isize::MAX {
             if main_thread {
-                let mut node = self
+                let node = self
                     .in_progress
                     .get_mut(self.blocked_main_event)
                     .unwrap_unchecked();
@@ -241,7 +241,7 @@ impl EventManager {
 
     /// Attempts to select the provided event node given constraints, creating an associated job if possible.
     #[inline(always)]
-    unsafe fn try_select_job(mut params: JobSelectionParams<'_>) -> Option<EventJob> {
+    unsafe fn try_select_job(params: JobSelectionParams<'_>) -> Option<EventJob> {
         let deps = params
             .ctx
             .transitive_dependencies_bi
