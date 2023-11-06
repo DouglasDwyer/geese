@@ -159,7 +159,6 @@ impl EventManager {
 
         if self.clogged_event.is_none() {
             let queue_result = self.queue_new_jobs(ctx, main_thread);
-            self.working_event = self.in_progress.end_index();
             if let Some(result) = queue_result {
                 self.blocked_main_event = isize::MAX;
                 return Ok(result);
@@ -294,6 +293,7 @@ impl EventManager {
                 if let Some(event) = self.event_lists.last_mut().unwrap_unchecked().pop_front() {
                     if Self::clogging_event(&*event) {
                         self.clogged_event = Some(event);
+                        self.working_event = self.in_progress.end_index();
                         return None;
                     } else if event.is::<notify::Delayed>() {
                         if self.in_progress.is_empty() {
@@ -327,6 +327,7 @@ impl EventManager {
                                 processing_count: &mut self.processing_count,
                                 main_thread_required: &mut self.blocked_main_event,
                             }) {
+                                self.working_event = id + 1;
                                 return Some(job);
                             }
                         }
@@ -346,7 +347,8 @@ impl EventManager {
                 break;
             }
         }
-
+        
+        self.working_event = self.in_progress.end_index();
         None
     }
 
