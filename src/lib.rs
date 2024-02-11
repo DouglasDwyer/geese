@@ -3,6 +3,8 @@
 #![cfg_attr(unstable, feature(const_type_name))]
 #![cfg_attr(unstable, feature(core_intrinsics))]
 
+#![allow(internal_features)]
+
 //! Geese is a game event system for Rust, built to allow modular game engine design.
 //!
 //! In Geese, a system is a struct with internal state and a collection of associated
