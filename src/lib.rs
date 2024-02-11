@@ -1,5 +1,7 @@
-#![cfg_attr(unstable, feature(const_format_args))]
+#![cfg_attr(unstable, feature(const_heap))]
 #![cfg_attr(unstable, feature(const_type_id))]
+#![cfg_attr(unstable, feature(const_type_name))]
+#![cfg_attr(unstable, feature(core_intrinsics))]
 
 //! Geese is a game event system for Rust, built to allow modular game engine design.
 //!
@@ -185,7 +187,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
                 if let Some(index) = S::DEPENDENCIES.index_of::<T>() {
                     index
                 } else {
-                    GeeseContextHandle::<S>::panic_on_invalid_dependency()
+                    GeeseContextHandle::<S>::panic_on_invalid_dependency::<T>()
                 },
                 usize,
                 S,
@@ -223,7 +225,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
                         );
                         index
                     } else {
-                        GeeseContextHandle::<S>::panic_on_invalid_dependency()
+                        GeeseContextHandle::<S>::panic_on_invalid_dependency::<T>()
                     }
                 },
                 usize,
@@ -250,9 +252,37 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
     }
 
     /// Panics when the user attempts to reference an undeclared dependency.
+    #[cfg(unstable)]
     #[inline(always)]
-    const fn panic_on_invalid_dependency() -> ! {
-        panic!("The specified system was not a dependency of this one.");
+    const fn panic_on_invalid_dependency<T: GeeseSystem>() -> ! {
+        unsafe {
+            /// The first segment of the error message.
+            const FIRST_SEGMENT: &str = "System ";
+            /// The second segment of the error message.
+            const SECOND_SEGMENT: &str = " was not a dependency of ";
+            let total_name = std::intrinsics::const_allocate(
+                FIRST_SEGMENT.len() + type_name::<T>().len() + SECOND_SEGMENT.len() + type_name::<S>().len(), 1);
+
+            let segments = [FIRST_SEGMENT, type_name::<T>(), SECOND_SEGMENT, type_name::<S>()];
+
+            let mut i = 0;
+            let mut position = 0;
+            while i < segments.len() {
+                let value = segments[i];
+                std::ptr::copy_nonoverlapping(value.as_ptr(), total_name.add(position), value.len());
+                position += value.len();
+                i += 1;
+            }
+            
+            panic!("{}", std::str::from_utf8_unchecked(std::slice::from_raw_parts(total_name.cast_const(), position)));
+        }
+    }
+
+    /// Panics when the user attempts to reference an undeclared dependency.
+    #[cfg(not(unstable))]
+    #[inline(always)]
+    fn panic_on_invalid_dependency<T: GeeseSystem>() -> ! {
+        panic!("System {} was not a dependency of {}", type_name::<T>(), type_name::<S>());
     }
 }
 

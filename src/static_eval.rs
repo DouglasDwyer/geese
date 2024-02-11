@@ -17,7 +17,7 @@ macro_rules! static_eval {
             #[cfg(not(unstable))]
             impl<$($type_parameter: GeeseSystem, )*> StaticEval<$($type_parameter, )*> {
                 #[inline(always)]
-                const fn calculate() -> $result_type {
+                fn calculate() -> $result_type {
                     $assertion
                 }
             }
