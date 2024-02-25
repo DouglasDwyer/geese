@@ -376,9 +376,6 @@ pub(super) trait SystemDescriptor: 'static + Send + Sync {
     /// The event handlers associated with this system.
     fn event_handlers(&self) -> &'static ConstList<'static, EventHandlerRaw>;
 
-    /// Whether this type may be safely sent across threads.
-    fn is_send(&self) -> bool;
-
     /// Whether references to this type may be safely shared across threads.
     fn is_sync(&self) -> bool;
 
@@ -411,10 +408,6 @@ impl<S: GeeseSystem> SystemDescriptor for TypedSystemDescriptor<S> {
 
     fn event_handlers(&self) -> &'static ConstList<'static, EventHandlerRaw> {
         S::EVENT_HANDLERS.as_inner()
-    }
-
-    fn is_send(&self) -> bool {
-        implements!(S, Send)
     }
 
     fn is_sync(&self) -> bool {

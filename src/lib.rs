@@ -1,4 +1,5 @@
 #![cfg_attr(unstable, feature(const_heap))]
+#![cfg_attr(unstable, feature(const_intrinsic_copy))]
 #![cfg_attr(unstable, feature(const_type_id))]
 #![cfg_attr(unstable, feature(const_type_name))]
 #![cfg_attr(unstable, feature(core_intrinsics))]
