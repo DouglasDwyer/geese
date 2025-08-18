@@ -51,7 +51,7 @@ impl<T> RwCell<T> {
 
     /// Immutably borrows the value of this cell.
     #[inline(always)]
-    pub fn borrow(&self) -> RwCellGuard<T> {
+    pub fn borrow(&self) -> RwCellGuard<'_,T> {
         unsafe {
             Self::abort_if(
                 self.inner.borrow_state.fetch_add(1, Ordering::AcqRel) >= u16::MAX - 1,
@@ -66,7 +66,7 @@ impl<T> RwCell<T> {
 
     /// Mutably borrows the value of this cell.
     #[inline(always)]
-    pub fn borrow_mut(&self) -> RwCellGuardMut<T> {
+    pub fn borrow_mut(&self) -> RwCellGuardMut<'_,T> {
         unsafe {
             Self::abort_if(
                 self.inner.borrow_state.swap(u16::MAX, Ordering::AcqRel) != 0,

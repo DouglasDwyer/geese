@@ -1,9 +1,8 @@
 #![cfg_attr(unstable, feature(const_heap))]
-#![cfg_attr(unstable, feature(const_intrinsic_copy))]
-#![cfg_attr(unstable, feature(const_type_id))]
 #![cfg_attr(unstable, feature(const_type_name))]
 #![cfg_attr(unstable, feature(core_intrinsics))]
-
+#![feature(const_cmp)]
+#![feature(const_trait_impl)]
 #![allow(internal_features)]
 
 //! Geese is a game event system for Rust, built to allow modular game engine design.
@@ -184,7 +183,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
 
     /// Obtains the specified system dependency.
     #[inline(always)]
-    pub fn get<T: GeeseSystem>(&self) -> SystemRef<T> {
+    pub fn get<T: GeeseSystem>(&self) -> SystemRef<'_,T> {
         unsafe {
             let index = static_eval!(
                 if let Some(index) = S::DEPENDENCIES.index_of::<T>() {
@@ -217,7 +216,7 @@ impl<S: GeeseSystem> GeeseContextHandle<S> {
 
     /// Mutably obtains the specified system dependency.
     #[inline(always)]
-    pub fn get_mut<T: GeeseSystem>(&mut self) -> SystemRefMut<T> {
+    pub fn get_mut<T: GeeseSystem>(&mut self) -> SystemRefMut<'_,T> {
         unsafe {
             let index = static_eval!(
                 {
@@ -397,7 +396,7 @@ impl GeeseContext {
 
     /// Obtains a reference to the given system.
     #[inline(always)]
-    pub fn get<S: GeeseSystem>(&self) -> SystemRef<S> {
+    pub fn get<S: GeeseSystem>(&self) -> SystemRef<'_,S> {
         unsafe {
             let inner = self.0.borrow();
             let index = inner
@@ -419,7 +418,7 @@ impl GeeseContext {
 
     /// Mutably obtains a reference to the given system.
     #[inline(always)]
-    pub fn get_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<S> {
+    pub fn get_mut<S: GeeseSystem>(&mut self) -> SystemRefMut<'_,S> {
         unsafe {
             let inner = self.0.borrow();
             let index = inner
@@ -1448,7 +1447,7 @@ impl SystemFlagsList {
     ///
     /// For this function to be sound, index must be less than the total number of systems.
     #[inline(always)]
-    pub unsafe fn edit_unchecked(&mut self, index: usize) -> SystemFlagsListEdit {
+    pub unsafe fn edit_unchecked(&mut self, index: usize) -> SystemFlagsListEdit<'_> {
         let (rest, first) = self.data.split_at_unchecked_mut(index * self.stride);
 
         SystemFlagsListEdit {
